@@ -1,5 +1,11 @@
 # @narumitw/pi-fleet
 
+## 0.3.0
+
+### Minor Changes
+
+- 984b554: Select the current tmux, Zellij, or Ghostty context automatically by default while keeping pinned and explicit backend choices strict.
+
 ## 0.2.0
 
 ### Minor Changes
