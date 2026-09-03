@@ -172,7 +172,7 @@ const DEFAULTS: A2AConfig = {
     rateLimitPerMin: 60,
     skills: [],
   },
-  timeouts: { send: 300000, async: 30000, stream: 120000 },
+  timeouts: { send: 360000, async: 30000, stream: 120000 },
   retryAttempts: 2,
   verifySsl: true,
   discovery: {
