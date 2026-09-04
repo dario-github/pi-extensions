@@ -5,7 +5,7 @@ import { DEFAULTS } from "./helpers";
 import { makeTempDir } from "./tmp";
 import { A2AServer, type SessionRunner } from "../lib/server";
 import type { A2AConfig } from "../lib/config";
-import { STATE_CANCELED, STATE_COMPLETED, STATE_FAILED, STATE_INPUT_REQUIRED, STATE_REJECTED } from "../lib/protocol";
+import { STATE_CANCELED, STATE_COMPLETED, STATE_FAILED, STATE_INPUT_REQUIRED, STATE_REJECTED, STATE_WORKING } from "../lib/protocol";
 import { authenticate } from "../lib/security";
 import { metrics } from "../lib/client";
 import { list as listRegistry } from "../lib/registry";
@@ -1059,6 +1059,100 @@ describe("server", () => {
         const got = await jsonRpc(url, "tasks/get", { id: tid });
         assert.equal(got.result.status.state, STATE_FAILED, "disconnect abort must beat a late resolve");
         assert.isUndefined(got.result.artifacts, "a disconnected task carries no partial artifact");
+      } finally {
+        await stop();
+      }
+    });
+  });
+
+  describe("non-blocking message/send (configuration.blocking=false) (#22)", () => {
+    // A2A v1.0 long-task contract: the dispatcher submits with
+    // configuration.blocking=false, gets a WORKING task back immediately, and
+    // polls tasks/get for the terminal state. Background execution is bounded
+    // by taskTimeoutSec, NOT replyTimeoutSec — a 10-minute generation must
+    // survive the 300s reply budget that guards blocking calls.
+
+    /** Poll tasks/get until terminal state or the deadline passes. */
+    async function waitTerminal(url: string, tid: string, headers: Record<string, string> = {}, ms = 5000): Promise<any> {
+      const deadline = Date.now() + ms;
+      for (;;) {
+        const r = await jsonRpc(url, "tasks/get", { id: tid }, headers);
+        const state = r.result?.status?.state;
+        if (state && state !== "TASK_STATE_WORKING" && state !== "TASK_STATE_SUBMITTED") return r.result;
+        if (Date.now() > deadline) throw new Error(`task ${tid} still ${state} after ${ms}ms`);
+        await new Promise((res) => setTimeout(res, 100));
+      }
+    }
+
+    it("returns WORKING immediately; tasks/get later yields COMPLETED + artifact", async () => {
+      const runner: SessionRunner = async () => {
+        await new Promise((r) => setTimeout(r, 400));
+        return { reply: "background done", inputRequired: false };
+      };
+      const { url, stop } = await startServer({ cfg: DEFAULTS(), runner });
+      try {
+        const r = await jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "long task" }] },
+          configuration: { blocking: false },
+        });
+        assert.equal(r.result.status.state, STATE_WORKING, "non-blocking returns a WORKING task");
+        const tid = r.result.id;
+        assert.exists(tid, "the task id is returned for polling");
+        // Immediately after: still WORKING.
+        const early = await jsonRpc(url, "tasks/get", { id: tid });
+        assert.equal(early.result.status.state, STATE_WORKING);
+        // After the runner finishes: COMPLETED with the reply artifact.
+        const final = await waitTerminal(url, tid);
+        assert.equal(final.status.state, STATE_COMPLETED);
+        assert.equal(final.artifacts?.[0]?.parts?.[0]?.text, "background done");
+      } finally {
+        await stop();
+      }
+    });
+
+    it("background execution is not killed by replyTimeoutSec", async () => {
+      const cfg = DEFAULTS();
+      cfg.server.replyTimeoutSec = 1; // blocking calls die after 1s
+      const runner: SessionRunner = async () => {
+        await new Promise((r) => setTimeout(r, 2000));
+        return { reply: "survived the reply budget", inputRequired: false };
+      };
+      const { url, stop } = await startServer({ cfg, runner });
+      try {
+        const r = await jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "2s task" }] },
+          configuration: { blocking: false },
+        });
+        assert.equal(r.result.status.state, STATE_WORKING);
+        const final = await waitTerminal(url, r.result.id, {}, 6000);
+        assert.equal(final.status.state, STATE_COMPLETED, "2s task survives a 1s reply timeout when non-blocking");
+        assert.equal(final.artifacts?.[0]?.parts?.[0]?.text, "survived the reply budget");
+      } finally {
+        await stop();
+      }
+    });
+
+    it("tasks/get ownership is enforced for background tasks (#10)", async () => {
+      const cfg = DEFAULTS();
+      cfg.server.peerTokens = { alice: "tok-alice", bob: "tok-bob" };
+      const runner: SessionRunner = async () => {
+        await new Promise((r) => setTimeout(r, 300));
+        return { reply: "alice result", inputRequired: false };
+      };
+      const aliceH = { Authorization: "Bearer tok-alice" };
+      const bobH = { Authorization: "Bearer tok-bob" };
+      const { url, stop } = await startServer({ cfg, runner });
+      try {
+        const r = await jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "alice bg" }] },
+          configuration: { blocking: false },
+        }, aliceH);
+        const tid = r.result.id;
+        const foreign = await jsonRpc(url, "tasks/get", { id: tid }, bobH);
+        assert.equal(foreign.error?.code, -32001, "foreign peer cannot poll the background task");
+        const own = await waitTerminal(url, tid, aliceH);
+        assert.equal(own.status.state, STATE_COMPLETED);
+        assert.equal(own.artifacts?.[0]?.parts?.[0]?.text, "alice result");
       } finally {
         await stop();
       }

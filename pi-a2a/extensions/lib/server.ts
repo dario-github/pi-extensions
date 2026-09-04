@@ -894,11 +894,35 @@ export class A2AServer {
       controller.signal.addEventListener("abort", () => externalSignal.removeEventListener("abort", onExternal), { once: true });
     }
 
+    // A2A v1.0: configuration.blocking=false detaches execution from the HTTP
+    // request — return the WORKING task now and let it run in the background
+    // under the much larger taskTimeoutSec budget; the caller polls tasks/get
+    // for the terminal state (#22).
+    const blocking = params.configuration?.blocking !== false;
+    const timeoutMs = (blocking ? this.cfg.server.replyTimeoutSec : this.cfg.server.taskTimeoutSec) * 1000;
+    const done = this.runTask(taskId, st, identity, inboundText, timeoutMs, blocking ? "reply timeout" : "task timeout");
+    if (!blocking) {
+      // runTask's catch already classifies every runner failure into the
+      // store; this guard only covers an unexpected escape.
+      done.catch(() => {});
+      return st.task; // WORKING snapshot — the id is the polling handle
+    }
+    return done;
+  }
+
+  private async runTask(
+    taskId: string,
+    st: StoredTask,
+    identity: string,
+    inboundText: string,
+    timeoutMs: number,
+    timeoutLabel: string,
+  ): Promise<any> {
+    const controller = st.controller!;
     this.running += 1;
     const startedAt = Date.now();
     try {
-      const timeoutMs = this.cfg.server.replyTimeoutSec * 1000;
-      const timer = setTimeout(() => controller.abort(new Error("reply timeout")), timeoutMs);
+      const timer = setTimeout(() => controller.abort(new Error(timeoutLabel)), timeoutMs);
       controller.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
       const wrapped = wrapInbound(identity, inboundText);
       const runner = this.requireRunner();

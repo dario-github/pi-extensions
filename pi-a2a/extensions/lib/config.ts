@@ -119,6 +119,10 @@ export interface A2AConfig {
     workspace: string;
     maxConcurrent: number;
     replyTimeoutSec: number;
+    /** Budget for non-blocking (configuration.blocking=false) background
+     * tasks — these outlive the HTTP request, so they get their own,
+     * much larger timeout instead of replyTimeoutSec (#22). */
+    taskTimeoutSec: number;
     agentName: string;
     publicUrl: string;
     sharedToken: string;
@@ -162,6 +166,7 @@ const DEFAULTS: A2AConfig = {
     workspace: "",
     maxConcurrent: 3,
     replyTimeoutSec: 300,
+    taskTimeoutSec: 3600,
     agentName: "",
     publicUrl: "",
     sharedToken: "",
@@ -309,6 +314,7 @@ function sanitizeRepoA2ASettings(s: any): any {
       "maxPingpongTurns",
       "maxConcurrent",
       "replyTimeoutSec",
+      "taskTimeoutSec",
     ])
       delete srv[k];
     c.server = srv;
@@ -429,6 +435,7 @@ export function loadConfig(opts: {
   cfg.server.workspace = String(srv.workspace ?? "");
   cfg.server.maxConcurrent = num(srv.maxConcurrent, DEFAULTS.server.maxConcurrent);
   cfg.server.replyTimeoutSec = num(srv.replyTimeoutSec ?? env.A2A_REPLY_TIMEOUT, DEFAULTS.server.replyTimeoutSec);
+  cfg.server.taskTimeoutSec = num(srv.taskTimeoutSec ?? env.A2A_TASK_TIMEOUT, DEFAULTS.server.taskTimeoutSec);
   cfg.server.agentName = String(srv.agentName ?? env.A2A_AGENT_NAME ?? "");
   cfg.server.publicUrl = String(srv.publicUrl ?? env.A2A_PUBLIC_URL ?? "");
   cfg.server.sharedToken = String(srv.sharedToken ?? env.A2A_BEARER_TOKEN ?? "");
