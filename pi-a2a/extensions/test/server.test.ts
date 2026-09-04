@@ -976,6 +976,95 @@ describe("server", () => {
     });
   });
 
+  describe("runner resolving after abort is not COMPLETED (#22)", () => {
+    // A runner that ignores (or finishes just after) the abort signal and
+    // resolves normally with a partial mid-work reply. messageSend must NOT
+    // take the success path: the task was killed, so a half-finished answer
+    // stored as a COMPLETED artifact makes a dead worker indistinguishable
+    // from a finished one (task-56f3c82f086c4c30). The abort must win.
+
+    /** Runner that waits for abort, then resolves with a partial reply anyway. */
+    function stubbornRunner(partial = "Enough evidence. Writing the plan."): SessionRunner {
+      return ({ signal }) =>
+        new Promise((resolve) => {
+          if (signal.aborted) return resolve({ reply: partial, inputRequired: false });
+          signal.addEventListener("abort", () => resolve({ reply: partial, inputRequired: false }), { once: true });
+        });
+    }
+
+    it("reply timeout + late resolve → FAILED, no partial artifact", async () => {
+      const cfg = DEFAULTS();
+      cfg.server.replyTimeoutSec = 1;
+      const { url, stop } = await startServer({ cfg, runner: stubbornRunner() });
+      try {
+        const r = await jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "slow" }] },
+        });
+        assert.equal(r.result.status.state, STATE_FAILED, "timeout abort must beat a late resolve");
+        assert.isUndefined(r.result.artifacts, "a timed-out task carries no partial artifact");
+      } finally {
+        await stop();
+      }
+    });
+
+    it("tasks/cancel + late resolve → CANCELED, no partial artifact", async () => {
+      const { url, stop } = await startServer({ cfg: DEFAULTS(), runner: stubbornRunner() });
+      try {
+        // Send in the background, grab the task id from the store, cancel it.
+        const sendP = jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "work" }] },
+        });
+        // Wait for the task to register, then cancel.
+        await new Promise((r) => setTimeout(r, 100));
+        const list = await jsonRpc(url, "tasks/list", {});
+        const tid = list.result.tasks[0]?.id;
+        assert.exists(tid, "a running task exists to cancel");
+        const cancel = await jsonRpc(url, "tasks/cancel", { id: tid });
+        assert.equal(cancel.result.status.state, STATE_CANCELED);
+        const send = await sendP;
+        assert.equal(send.result.status.state, STATE_CANCELED, "user cancel stays CANCELED");
+        assert.isUndefined(send.result.artifacts, "a canceled task carries no partial artifact");
+      } finally {
+        await stop();
+      }
+    });
+
+    it("stream disconnect + late resolve → FAILED, no partial artifact", async () => {
+      const cfg = DEFAULTS();
+      cfg.server.replyTimeoutSec = 30;
+      const { url, stop } = await startServer({ cfg, runner: stubbornRunner() });
+      try {
+        const ac = new AbortController();
+        // NOTE: the server writes no SSE frame until the task settles, so the
+        // fetch promise may not resolve on writeHead alone — never await it.
+        void fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "sse-x",
+            method: "message/stream",
+            params: { message: { role: "ROLE_USER", parts: [{ text: "stream" }] } },
+          }),
+          signal: ac.signal,
+        }).then((r) => r.text()).catch(() => {});
+        // Let the server register and start the task, then disconnect.
+        await new Promise((r) => setTimeout(r, 300));
+        ac.abort();
+        // Let the runner's abort handler fire and messageSend settle.
+        await new Promise((r) => setTimeout(r, 300));
+        const list = await jsonRpc(url, "tasks/list", {});
+        const tid = list.result.tasks[0]?.id;
+        assert.exists(tid, "the streaming task registered");
+        const got = await jsonRpc(url, "tasks/get", { id: tid });
+        assert.equal(got.result.status.state, STATE_FAILED, "disconnect abort must beat a late resolve");
+        assert.isUndefined(got.result.artifacts, "a disconnected task carries no partial artifact");
+      } finally {
+        await stop();
+      }
+    });
+  });
+
   describe("reply timeout classifies as FAILED (not CANCELED)", () => {
     it("times out a slow task to STATE_FAILED", async () => {
       const cfg = DEFAULTS();

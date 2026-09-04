@@ -908,6 +908,13 @@ export class A2AServer {
         onProgress: (line) => this.onActivity?.({ type: "progress", taskId, line }),
       });
       clearTimeout(timer);
+      // The abort wins over a late resolve: a runner that ignores the signal
+      // (or finishes concurrently with it) must NOT take the success path —
+      // otherwise a killed task is stored COMPLETED with a partial mid-work
+      // artifact, indistinguishable from a finished one (#22).
+      if (controller.signal.aborted) {
+        throw controller.signal.reason ?? new Error("aborted");
+      }
       const finalState = out.inputRequired ? STATE_INPUT_REQUIRED : STATE_COMPLETED;
       // Outbound redaction: replies cross the trust boundary back to a peer,
       // so scrub credential-shaped substrings (sk-*, ghp_*, bearer …, emails,
