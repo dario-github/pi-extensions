@@ -12,8 +12,9 @@
  * redaction, inbound injection filtering, audit log, anti-loop.
  */
 
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -47,6 +48,122 @@ function piDir(): string {
 
 function cfgFor(ctx: ExtensionContext): A2AConfig {
   return loadConfig({ ctx, cwd: ctx.cwd ?? process.cwd() });
+}
+
+// ---------------------------------------------------------------------------
+// AgentTeam patch (DC 2026-09-04: auditable session naming + Dashboard
+// visibility). Same patch family as the inbound-observability patch below.
+// ① Unpinned host sessions whose cwd sits under a workstation path in the
+//   nearest workstations.tsv auto-name `<ws>-<seq>` instead of <host>-<port>.
+// ② Inbound child sessions register `<ws>-inbound-<n>` in a2a_registry (with
+//   sessionFile + busy/done status + heartbeat) so the cmux Dashboard cache
+//   shows which background task each workstation is running.
+// ---------------------------------------------------------------------------
+
+/** Walk up from cwd to the nearest workstations.tsv; return the workstation
+ *  name whose registered path contains cwd (longest match), else null.
+ *  Only local (mac) rows can match a local cwd; remote rows (~devbox:…)
+ *  are skipped. */
+function workstationForCwd(cwd: string): string | null {
+  try {
+    const abs0 = resolve(cwd);
+    let dir = abs0;
+    for (;;) {
+      const tsv = join(dir, "workstations.tsv");
+      if (existsSync(tsv)) {
+        let best: { name: string; len: number } | null = null;
+        for (const line of readFileSync(tsv, "utf-8").split("\n")) {
+          if (!line || line.startsWith("#")) continue;
+          const cols = line.split("\t");
+          if (cols.length < 4) continue;
+          const [name, , host, p] = cols;
+          if (host !== "mac" || !p || p.startsWith("~")) continue;
+          const abs = resolve(dir, p);
+          if (abs0 === abs || abs0.startsWith(abs + "/")) {
+            if (!best || abs.length > best.len) best = { name, len: abs.length };
+          }
+        }
+        return best?.name ?? null;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      dir = parent;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** Smallest `<base>-<n>` not present in the local registry; a live pinned
+ *  `<base>` occupies seq 1, so a second session in the same workstation
+ *  becomes `<base>-2`. Best-effort: races self-heal via the registry's
+ *  stale-entry GC. */
+function allocRegistryName(base: string): string {
+  const names = new Set<string>();
+  try {
+    for (const f of readdirSync(join(piDir(), "a2a_registry"))) {
+      if (!/^\d+\.json$/.test(f)) continue;
+      try {
+        const d = JSON.parse(readFileSync(join(piDir(), "a2a_registry", f), "utf-8"));
+        if (d?.agentName) names.add(String(d.agentName));
+      } catch {
+        /* skip unreadable entry */
+      }
+    }
+  } catch {
+    /* no registry dir yet */
+  }
+  let n = 1;
+  while (names.has(`${base}-${n}`) || (n === 1 && names.has(base))) n++;
+  return `${base}-${n}`;
+}
+
+let inboundSeq = 0;
+
+/** Register an inbound child session in the local registry so the cmux
+ *  Dashboard cache shows live background tasks per workstation. The filename
+ *  stays `<digits>.json` so the registry's own lister sweeps it via mtime
+ *  TTL + pid liveness probe once the heartbeat stops. Returns finalize(),
+ *  which stops the heartbeat and writes the terminal status (the entry
+ *  lingers one TTL so a just-finished task is still visible). */
+function registerInbound(cwd: string, sessionFile: string): (status: "done" | "aborted") => void {
+  const pid = process.pid;
+  const key = pid * 1000 + (++inboundSeq % 1000); // numeric, distinct from host <pid>.json
+  const file = join(piDir(), "a2a_registry", `${key}.json`);
+  const ws = workstationForCwd(cwd);
+  const base = `${ws ?? hostname().replace(/\..*$/, "").toLowerCase()}-inbound`;
+  const name = allocRegistryName(base);
+  const startedAt = new Date().toISOString();
+  let desc: any = { url: "", port: 0, host: "127.0.0.1", model: null, tools: [], skills: [] };
+  try {
+    // Inherit url/port/model from the host's own registry entry.
+    desc = { ...desc, ...JSON.parse(readFileSync(join(piDir(), "a2a_registry", `${pid}.json`), "utf-8")) };
+  } catch {
+    /* host entry missing — blanks are fine */
+  }
+  const write = (status: string) => {
+    try {
+      mkdirSync(join(piDir(), "a2a_registry"), { recursive: true });
+      writeFileSync(
+        file,
+        JSON.stringify(
+          { ...desc, pid, cwd, agentName: name, kind: "inbound", sessionFile, status, startedAt, mtime: Date.now() },
+          null,
+          2,
+        ),
+        "utf-8",
+      );
+    } catch {
+      /* best-effort — discovery is non-critical */
+    }
+  };
+  write("busy");
+  const timer = setInterval(() => write("busy"), 15000);
+  timer.unref?.();
+  return (status) => {
+    clearInterval(timer);
+    write(status);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +219,9 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
       model,
       thinkingLevel: ctx.thinkingLevel ?? "medium",
       resourceLoader,
-      sessionManager: SessionManager.inMemory(cwd),
+      // On disk (not inMemory) so an inbound task's full transcript survives
+      // timeout/abort and can be inspected: ~/.pi/agent/a2a_inbound_sessions/
+      sessionManager: SessionManager.create(cwd, join(sdk.getAgentDir(), "a2a_inbound_sessions")),
       settingsManager,
       ...(modelRegistry?.runtime ? { modelRuntime: modelRegistry.runtime } : {}),
       ...(modelRegistry?.authStorage
@@ -167,6 +286,8 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
       }
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    const sessionFile = session.sessionManager?.getSessionFile?.() ?? "(unknown)";
+    const finalizeInbound = registerInbound(cwd, sessionFile);
     try {
       // Settle the race on prompt() completion, not on agent_end: agent_end
       // fires when the model turn ends — BEFORE the post-run overflow
@@ -178,8 +299,10 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
       // it. prompt() resolves only after recovery and any continuation
       // turns finish; aborts still settle the race immediately via onAbort
       // above.
+      onProgress?.(`session file: ${sessionFile}`);
       await Promise.race([session.prompt(message), done]);
     } finally {
+      finalizeInbound(signal.aborted ? "aborted" : "done");
       signal.removeEventListener("abort", onAbort);
       unsub();
       // dispose() does NOT emit session_shutdown (it only invalidates the
@@ -222,7 +345,8 @@ const activeInboundTasks = new Map<string, { identity: string; last: InboundActi
 
 /**
  * Surface an inbound activity event to the host TUI.
- * - transcript on: sendMessage (custom message, visible in transcript)
+ * - transcript on: appendEntry (TUI-only custom entry — visible in transcript,
+ *   NOT in LLM context; sendMessage would bill every line into each later turn)
  * - always: notify() toast on arrived/completed/failed
  * Caller provides the ctx for ui access (may be undefined in tests).
  */
@@ -235,11 +359,7 @@ function broadcastActivity(
   const transcript = cfg?.ui?.transcript ?? true;
   if (transcript) {
     try {
-      pi.sendMessage({
-        customType: "a2a-inbound",
-        content: activityToText(a),
-        display: true,
-      });
+      pi.appendEntry("a2a-inbound", { text: activityToText(a) });
     } catch {
       /* session may be mid-replace; ignore */
     }
@@ -353,13 +473,9 @@ export default function a2aExtension(pi: ExtensionAPI): void {
   //   ⚙ dim      — isolated session executing tools to answer
   //   ✎ success  — reply being sent back
   //   ✓ success / ✗ error — completion markers
-  pi.registerMessageRenderer?.("a2a-inbound", (message, _opts, theme) => {
+  const renderInbound = (content: string, theme: any) => {
     try {
       const fg = theme.fg.bind(theme);
-      const raw = message.content;
-      const content = typeof raw === "string"
-        ? raw
-        : (Array.isArray(raw) ? raw.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("") : "");
       const kind = classifyLine(content);
       const icon =
         kind === "received" ? "⚑" :
@@ -375,6 +491,17 @@ export default function a2aExtension(pi: ExtensionAPI): void {
     } catch {
       return undefined; // pi-tui unavailable → fall back to default rendering
     }
+  };
+  // Current path: TUI-only entries (appendEntry).
+  pi.registerEntryRenderer?.("a2a-inbound", (entry: any, _opts: any, theme: any) =>
+    renderInbound(String(entry?.data?.text ?? ""), theme));
+  // Legacy: sessions persisted before the appendEntry switch still carry custom messages.
+  pi.registerMessageRenderer?.("a2a-inbound", (message: any, _opts: any, theme: any) => {
+    const raw = message.content;
+    const content = typeof raw === "string"
+      ? raw
+      : (Array.isArray(raw) ? raw.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("") : "");
+    return renderInbound(content, theme);
   });
 
   // -------------------------------------------------------------------------
@@ -1040,6 +1167,13 @@ export default function a2aExtension(pi: ExtensionAPI): void {
     if (!ctx.hasUI && ctx.mode !== "json") return;
     const cfg = cfgFor(ctx);
     if (!cfg.server.enabled) return;
+    // AgentTeam patch: unpinned sessions in a workstation directory get an
+    // auditable name (<ws>-<seq>) instead of <host>-<port>. Pinned names
+    // (bin/ws A2A_AGENT_NAME or settings a2a.server.agentName) always win.
+    if (!cfg.server.agentName) {
+      const ws = workstationForCwd(ctx.cwd ?? process.cwd());
+      if (ws) cfg.server.agentName = allocRegistryName(ws);
+    }
     try {
       server = new A2AServer({
         cfg,
