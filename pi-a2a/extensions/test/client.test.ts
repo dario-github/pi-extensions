@@ -5,6 +5,7 @@ import { makeTempDir } from "./tmp";
 import {
   a2aCall,
   a2aDiscover,
+  a2aHistory,
   a2aList,
   a2aOrchestrate,
   a2aSend,
@@ -437,6 +438,57 @@ describe("client", () => {
       const out = await a2aTask({ cfg: cfgWithBob(), piDir, agent: "bob", taskId: "task-9" });
       assert.include(out, "working");
       assert.notInclude(out, "the answer");
+    });
+
+    it("polling the same COMPLETED task twice persists/counts it only once", async () => {
+      globalThis.fetch = (async (_url: string, init?: any) => {
+        if (init?.method === "POST") {
+          const body = JSON.parse(init.body);
+          return makeResp({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              id: "task-dup",
+              contextId: "ctx-dup",
+              status: { state: STATE_COMPLETED },
+              artifacts: [{ parts: [{ text: "the answer" }] }],
+            },
+          }, 200);
+        }
+        return makeResp(null, 200);
+      }) as any;
+      const cfg = cfgWithBob();
+      const beforeCompleted = metrics.tasksCompleted;
+      const out1 = await a2aTask({ cfg, piDir, agent: "bob", taskId: "task-dup" });
+      const out2 = await a2aTask({ cfg, piDir, agent: "bob", taskId: "task-dup" });
+      assert.include(out1, "the answer");
+      assert.include(out2, "the answer", "repeat polls still surface the reply");
+      assert.equal(metrics.tasksCompleted, beforeCompleted + 1, "completion counted once");
+      const history = a2aHistory({ piDir, contextId: "ctx-dup" });
+      assert.equal(history.split("the answer").length - 1, 1, "history holds exactly one agent reply");
+    });
+
+    it("a2aTask surfaces INPUT_REQUIRED with a context continuation hint", async () => {
+      globalThis.fetch = (async (_url: string, init?: any) => {
+        if (init?.method === "POST") {
+          const body = JSON.parse(init.body);
+          return makeResp({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              id: "task-9",
+              contextId: "ctx-9",
+              status: { state: "TASK_STATE_INPUT_REQUIRED", message: { parts: [{ text: "which region?" }] } },
+            },
+          }, 200);
+        }
+        return makeResp(null, 200);
+      }) as any;
+      const out = await a2aTask({ cfg: cfgWithBob(), piDir, agent: "bob", taskId: "task-9" });
+      assert.include(out, "input-required");
+      assert.include(out, "which region?");
+      assert.include(out, "context_id='ctx-9'");
+      assert.notInclude(out, "Still running");
     });
 
     it("a2aTask maps -32001 to a clear not-found error", async () => {

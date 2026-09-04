@@ -1132,6 +1132,32 @@ describe("server", () => {
       }
     });
 
+    it("a throwing background runner leaves no lingering task timer", async () => {
+      // Regression: the taskTimeoutSec timer must be cleared on EVERY runTask
+      // exit — a plain runner throw is not an abort, and a 1h lingering
+      // timer keeps the host process alive.
+      const activeTimeouts = () => (process as any)._getActiveHandles().filter((h: any) => h?.constructor?.name === "Timeout").length;
+      const cfg = DEFAULTS();
+      cfg.server.taskTimeoutSec = 3600; // worst case: an uncleared timer lives an hour
+      const runner: SessionRunner = async () => {
+        throw new Error("boom immediately");
+      };
+      const { url, stop } = await startServer({ cfg, runner });
+      try {
+        const baseline = activeTimeouts();
+        const r = await jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "throws" }] },
+          configuration: { blocking: false },
+        });
+        const final = await waitTerminal(url, r.result.id);
+        assert.equal(final.status.state, STATE_FAILED);
+        // The task is settled — its timer must be gone.
+        assert.equal(activeTimeouts(), baseline, "settled background tasks leave no timers behind");
+      } finally {
+        await stop();
+      }
+    });
+
     it("tasks/get ownership is enforced for background tasks (#10)", async () => {
       const cfg = DEFAULTS();
       cfg.server.peerTokens = { alice: "tok-alice", bob: "tok-bob" };

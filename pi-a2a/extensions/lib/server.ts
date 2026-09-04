@@ -921,9 +921,11 @@ export class A2AServer {
     const controller = st.controller!;
     this.running += 1;
     const startedAt = Date.now();
+    // Hoisted so the finally clears it on EVERY exit — a runner that throws
+    // without an abort must not leave a taskTimeoutSec (up to 1h) timer
+    // keeping the process alive.
+    const timer = setTimeout(() => controller.abort(new Error(timeoutLabel)), timeoutMs);
     try {
-      const timer = setTimeout(() => controller.abort(new Error(timeoutLabel)), timeoutMs);
-      controller.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
       const wrapped = wrapInbound(identity, inboundText);
       const runner = this.requireRunner();
       const out = await runner({
@@ -931,7 +933,6 @@ export class A2AServer {
         signal: controller.signal,
         onProgress: (line) => this.onActivity?.({ type: "progress", taskId, line }),
       });
-      clearTimeout(timer);
       // The abort wins over a late resolve: a runner that ignores the signal
       // (or finishes concurrently with it) must NOT take the success path —
       // otherwise a killed task is stored COMPLETED with a partial mid-work
@@ -1003,6 +1004,7 @@ export class A2AServer {
       }
       return st.task;
     } finally {
+      clearTimeout(timer);
       this.running -= 1;
     }
   }

@@ -674,9 +674,14 @@ export async function a2aSend(opts: {
   return (
     `${header}\n` +
     `Task ${result.taskId || "(no id returned)"} accepted for background execution. ` +
-    `Poll with a2a_task(agent '${agent}', task_id '${result.taskId}').`
+    `Poll with a2a_task(agent='${agent}', task_id='${result.taskId}').`
   );
 }
+
+// Terminal receipts for polled tasks: a2a_task persists the final reply and
+// bumps completion metrics ONCE per peer+task, so repeated polls of the same
+// COMPLETED task don't duplicate history entries or double-count (#22).
+const polledTerminal = new Set<string>();
 
 export async function a2aTask(opts: {
   cfg: A2AConfig;
@@ -704,15 +709,39 @@ export async function a2aTask(opts: {
   const ctx = String(task?.contextId ?? "");
   const reply = replyTextFromResult(task);
   const header = `[A2A ← ${agent} · task ${taskId}${ctx ? ` · context ${ctx}` : ""}${state ? ` · ${shortState(state)}` : ""}]`;
-  if (state === "TASK_STATE_COMPLETED") {
+  // Persist + count a terminal result at most once per peer+task.
+  const receiptKey = `${agent}:${taskId}`;
+  const firstTerminalPoll = !polledTerminal.has(receiptKey);
+  const markTerminal = (): void => {
+    polledTerminal.add(receiptKey);
     if (reply) persistMessage({ piDir: opts.piDir, contextId: ctx || newContextId(), role: "agent", text: reply, taskId, peer: agent });
-    metrics.tasksCompleted += 1;
+  };
+  if (state === "TASK_STATE_COMPLETED") {
+    if (firstTerminalPoll) {
+      markTerminal();
+      metrics.tasksCompleted += 1;
+    }
     return `${header}\n${reply || "(no text reply)"}`;
   }
-  if (state === "TASK_STATE_FAILED" || state === "TASK_STATE_CANCELED" || state === "TASK_STATE_REJECTED") {
-    if (reply) persistMessage({ piDir: opts.piDir, contextId: ctx || newContextId(), role: "agent", text: reply, taskId, peer: agent });
-    metrics.tasksFailed += 1;
+  if (state === "TASK_STATE_FAILED" || state === "TASK_STATE_REJECTED") {
+    if (firstTerminalPoll) {
+      markTerminal();
+      metrics.tasksFailed += 1;
+    }
     return `${header}\n${reply || `(task ended ${shortState(state)} with no message)`}`;
+  }
+  if (state === "TASK_STATE_CANCELED") {
+    // A user cancel is not a failure — same accounting as a2a_call/server.
+    if (firstTerminalPoll) markTerminal();
+    return `${header}\n${reply || "(task was canceled)"}`;
+  }
+  if (state === "TASK_STATE_INPUT_REQUIRED") {
+    // Interactive, not terminal: the peer is waiting for more input — answer
+    // with a blocking follow-up on the same context.
+    return (
+      `${header}\n${reply || "(the peer needs more input)"}` +
+      (ctx ? `\n\n(Answer with a2a_call(agent='${agent}', message='…', context_id='${ctx}').)` : "")
+    );
   }
   return `${header}\nStill running — poll again later.`;
 }
