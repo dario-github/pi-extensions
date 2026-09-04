@@ -388,7 +388,8 @@ describe("client", () => {
       }) as any;
       const out = await a2aSend({ cfg: cfgWithBob(), piDir, agent: "bob", message: "long job" });
       assert.equal(sentBody?.method, "SendMessage");
-      assert.equal(sentBody?.params?.configuration?.blocking, false, "must request non-blocking execution");
+      assert.equal(sentBody?.params?.configuration?.blocking, false, "deprecated alias kept for older peers");
+      assert.equal(sentBody?.params?.configuration?.returnImmediately, true, "must request non-blocking execution (A2A v1.0 current name)");
       assert.include(out, "task-9");
       assert.include(out, "ctx-9");
       assert.include(out, "working");

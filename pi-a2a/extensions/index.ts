@@ -424,7 +424,7 @@ export default function a2aExtension(pi: ExtensionAPI): void {
     label: "A2A Send (non-blocking)",
     description:
       "Submit a task to a remote A2A agent WITHOUT waiting for it to finish (A2A v1.0 " +
-      "configuration.blocking=false). Returns a task id immediately; the peer executes in " +
+      "SendMessageConfiguration.returnImmediately=true). Returns a task id immediately; the peer executes in " +
       "the background (bounded by its taskTimeoutSec, not the reply timeout), so use this " +
       "for long-running work (multi-minute generation, batch jobs). Poll the result with a2a_task.",
     promptSnippet: "submit a long task to a remote A2A agent and poll for the result later",

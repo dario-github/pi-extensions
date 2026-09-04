@@ -1065,9 +1065,10 @@ describe("server", () => {
     });
   });
 
-  describe("non-blocking message/send (configuration.blocking=false) (#22)", () => {
+  describe("non-blocking message/send (returnImmediately / blocking=false) (#22)", () => {
     // A2A v1.0 long-task contract: the dispatcher submits with
-    // configuration.blocking=false, gets a WORKING task back immediately, and
+    // configuration.returnImmediately=true (or the deprecated blocking=false
+    // alias), gets a WORKING task back immediately, and
     // polls tasks/get for the terminal state. Background execution is bounded
     // by taskTimeoutSec, NOT replyTimeoutSec — a 10-minute generation must
     // survive the 300s reply budget that guards blocking calls.
@@ -1105,6 +1106,26 @@ describe("server", () => {
         const final = await waitTerminal(url, tid);
         assert.equal(final.status.state, STATE_COMPLETED);
         assert.equal(final.artifacts?.[0]?.parts?.[0]?.text, "background done");
+      } finally {
+        await stop();
+      }
+    });
+
+    it("accepts the current v1.0 field name returnImmediately=true", async () => {
+      const runner: SessionRunner = async () => {
+        await new Promise((r) => setTimeout(r, 300));
+        return { reply: "ri done", inputRequired: false };
+      };
+      const { url, stop } = await startServer({ cfg: DEFAULTS(), runner });
+      try {
+        const r = await jsonRpc(url, "SendMessage", {
+          message: { role: "ROLE_USER", parts: [{ text: "long task" }] },
+          configuration: { returnImmediately: true },
+        });
+        assert.equal(r.result.status.state, STATE_WORKING, "returnImmediately=true returns a WORKING task");
+        const final = await waitTerminal(url, r.result.id);
+        assert.equal(final.status.state, STATE_COMPLETED);
+        assert.equal(final.artifacts?.[0]?.parts?.[0]?.text, "ri done");
       } finally {
         await stop();
       }

@@ -894,11 +894,14 @@ export class A2AServer {
       controller.signal.addEventListener("abort", () => externalSignal.removeEventListener("abort", onExternal), { once: true });
     }
 
-    // A2A v1.0: configuration.blocking=false detaches execution from the HTTP
-    // request — return the WORKING task now and let it run in the background
-    // under the much larger taskTimeoutSec budget; the caller polls tasks/get
-    // for the terminal state (#22).
-    const blocking = params.configuration?.blocking !== false;
+    // A2A v1.0 SendMessageConfiguration execution mode: returnImmediately=true
+    // detaches execution from the HTTP request — return the WORKING task now
+    // and let it run in the background under the much larger taskTimeoutSec
+    // budget; the caller polls tasks/get for the terminal state (#22).
+    // `blocking === false` is the pre-rename alias (spec §1.4 change control):
+    // accepted so older peers keep working until the next major.
+    const cfgExec = params.configuration ?? {};
+    const blocking = !(cfgExec.returnImmediately === true || cfgExec.blocking === false);
     const timeoutMs = (blocking ? this.cfg.server.replyTimeoutSec : this.cfg.server.taskTimeoutSec) * 1000;
     const done = this.runTask(taskId, st, identity, inboundText, timeoutMs, blocking ? "reply timeout" : "task timeout");
     if (!blocking) {

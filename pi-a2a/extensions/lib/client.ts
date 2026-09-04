@@ -471,7 +471,16 @@ async function sendTask(opts: {
     method: "SendMessage",
     params: {
       message: textMessage(ROLE_USER, safe, ctx),
-      ...(opts.blocking === false ? { configuration: { blocking: false } } : {}),
+      ...(opts.blocking === false
+        ? {
+            configuration: {
+              // A2A v1.0 current name; `blocking:false` kept alongside as the
+              // deprecated pre-rename alias for older peers (#22).
+              returnImmediately: true,
+              blocking: false,
+            },
+          }
+        : {}),
     },
   };
 
