@@ -320,24 +320,11 @@ export class Metrics {
 export const metrics = new Metrics();
 
 // ---------------------------------------------------------------------------
-// Core send path
+// Shared peer plumbing (headers / SSRF pin / name resolution)
 // ---------------------------------------------------------------------------
 
-export interface SendResult {
-  reply: string;
-  contextId: string;
-  state: string;
-}
-
-async function sendTask(opts: {
-  cfg: A2AConfig;
-  piDir: string;
-  peer: Peer;
-  agentLabel: string;
-  message: string;
-  contextId?: string;
-}): Promise<SendResult> {
-  const { cfg, piDir, peer, agentLabel, message } = opts;
+/** Auth + advisory identity/attribution headers for a peer call. */
+function buildPeerHeaders(cfg: A2AConfig, peer: Peer, agentLabel: string): Record<string, string> {
   const headers = authHeaders(peer);
   // Asserted sender identity (X-A2A-Identity): lets the receiving peer
   // attribute this dispatch to a NAME (e.g. "pi-kimchi") instead of the
@@ -373,6 +360,95 @@ async function sendTask(opts: {
       cfg.selfIdentity || gwName || cfg.server.agentName || "";
     if (caller) headers["X-Gateway-Caller"] = caller;
   }
+  return headers;
+}
+
+/** SSRF pin: prefer the peer's own publishing gateway origin (overlay-first
+ * routing works even when the live config has no gateway block); fall back
+ * to the configured gateway origins; an empty set means the peer is not
+ * gateway-pinned → normal assertSafeUrl applies. */
+function gatewayOriginsForPeer(cfg: A2AConfig, peer: Peer): Set<string> | undefined {
+  if (!peer.viaGateway) return undefined;
+  if (peer.gatewayUrl) {
+    try {
+      return new Set([new URL(peer.gatewayUrl).origin]);
+    } catch {
+      return undefined;
+    }
+  }
+  const origins = gatewayOrigins(cfg);
+  // Empty set = no gateway configured → normal assertSafeUrl applies.
+  return origins.size > 0 ? origins : undefined;
+}
+
+/** Resolve an agent name/URL to a peer, or produce the model-facing error. */
+function resolveCallPeer(
+  cfg: A2AConfig,
+  piDir: string,
+  agent: string,
+  discoveredPeers?: DiscoveredPeer[],
+): { peer: Peer } | { error: string } {
+  const known = knownLoopbackUrls(cfg, piDir);
+  let peer = resolvePeer(cfg, agent, { knownLoopbackUrls: known });
+  if (!peer || !peer.url) {
+    // Discovered-peer name lookup (local registry / mDNS). Ambiguous names
+    // error with the candidate URLs instead of guessing a target.
+    const matches = (discoveredPeers ?? []).filter((d) => d.name === agent && d.url);
+    if (matches.length > 1) {
+      return {
+        error:
+          `Error: ${matches.length} discovered peers share the name '${agent}' — ` +
+          `call by URL: ${matches.map((m) => m.url).join(", ")}`,
+      };
+    }
+    if (matches.length === 1) {
+      // ponytail: re-resolve via the URL branch so loopback-token/SSRF policy is inherited verbatim
+      peer = resolvePeer(cfg, matches[0]!.url, { knownLoopbackUrls: known });
+    }
+  }
+  if (!peer || !peer.url) {
+    return {
+      error:
+        `Error: unknown agent '${agent}'. Configure it under 'a2a.peers' in ` +
+        `settings.json, pass a full http(s):// URL, or use a name from a2a_peers.`,
+    };
+  }
+  return { peer };
+}
+
+/** Map a transport/RPC failure to the model-facing error string. */
+function callErrorText(agent: string, e: any): string {
+  const msg = e?.message || String(e);
+  if (/HTTP 401|HTTP 403/.test(msg)) return `Error: peer '${agent}' rejected auth. Check the configured token.`;
+  if (/HTTP 429/.test(msg)) return `Error: peer '${agent}' rate limited us (HTTP 429). Retry later.`;
+  return `Error: call to '${agent}' failed — ${msg}`;
+}
+
+// ---------------------------------------------------------------------------
+// Core send path
+// ---------------------------------------------------------------------------
+
+export interface SendResult {
+  reply: string;
+  contextId: string;
+  state: string;
+  /** Server-side task id — the polling handle for non-blocking sends (#22). */
+  taskId: string;
+}
+
+async function sendTask(opts: {
+  cfg: A2AConfig;
+  piDir: string;
+  peer: Peer;
+  agentLabel: string;
+  message: string;
+  contextId?: string;
+  /** false → submit with configuration.blocking=false: the peer answers with a
+   * WORKING task immediately and executes in the background (#22). */
+  blocking?: boolean;
+}): Promise<SendResult> {
+  const { cfg, piDir, peer, agentLabel, message } = opts;
+  const headers = buildPeerHeaders(cfg, peer, agentLabel);
   const timeout = peer.timeout || cfg.timeouts.send;
 
   // Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
@@ -395,6 +471,7 @@ async function sendTask(opts: {
     method: "SendMessage",
     params: {
       message: textMessage(ROLE_USER, safe, ctx),
+      ...(opts.blocking === false ? { configuration: { blocking: false } } : {}),
     },
   };
 
@@ -402,25 +479,7 @@ async function sendTask(opts: {
   metrics.outboundTotal += 1;
 
   const started = Date.now();
-  // SSRF pin: prefer the peer's own publishing gateway origin (overlay-first
-  // routing works even when the live config has no gateway block); fall back
-  // to the configured gateway origins; an empty set means the peer is not
-  // gateway-pinned → normal assertSafeUrl applies.
-  let gwOrigins: Set<string> | undefined;
-  if (peer.viaGateway) {
-    if (peer.gatewayUrl) {
-      try {
-        gwOrigins = new Set([new URL(peer.gatewayUrl).origin]);
-      } catch {
-        gwOrigins = undefined;
-      }
-    } else {
-      const origins = gatewayOrigins(cfg);
-      // Empty set = no gateway configured → normal assertSafeUrl applies.
-      gwOrigins = origins.size > 0 ? origins : undefined;
-    }
-  }
-  const resp = await postJsonRpc(rpcUrl(peer.url, card), rpcBody, headers, timeout, gwOrigins);
+  const resp = await postJsonRpc(rpcUrl(peer.url, card), rpcBody, headers, timeout, gatewayOriginsForPeer(cfg, peer));
   metrics.recordLatency(Date.now() - started);
   if (resp.error) {
     const msg = resp.error.message || JSON.stringify(resp.error);
@@ -430,14 +489,17 @@ async function sendTask(opts: {
   const reply = replyTextFromResult(result);
   const replyCtx = contextFromResult(result, ctx);
   const state = stateFromResult(result);
+  const resultTaskId = String(unwrapSendMessageResponse(result)?.id ?? "");
   // Persist BOTH the user message and the agent reply under the SAME contextId
   // (replyCtx) so a2a_history returns the complete conversation, not half.
+  // Non-blocking sends have no reply yet — the terminal reply is persisted by
+  // a2aTask when the task completes (#22).
   persistMessage({ piDir, contextId: replyCtx, role: "user", text: safe, taskId: String(rpcBody.id), peer: agentLabel });
-  persistMessage({ piDir, contextId: replyCtx, role: "agent", text: reply, taskId: String(rpcBody.id), peer: agentLabel });
+  if (reply) persistMessage({ piDir, contextId: replyCtx, role: "agent", text: reply, taskId: String(rpcBody.id), peer: agentLabel });
   metrics.inboundTotal += 1;
   if (state === "TASK_STATE_COMPLETED") metrics.tasksCompleted += 1;
   if (state === "TASK_STATE_FAILED") metrics.tasksFailed += 1;
-  return { reply, contextId: replyCtx, state };
+  return { reply, contextId: replyCtx, state, taskId: resultTaskId };
 }
 
 // ---------------------------------------------------------------------------
@@ -508,29 +570,9 @@ export async function a2aCall(opts: {
   const agent = (opts.agent || "").trim();
   const message = (opts.message || "").trim();
   if (!agent || !message) return "Error: both 'agent' and 'message' are required.";
-  const known = knownLoopbackUrls(opts.cfg, opts.piDir);
-  let peer = resolvePeer(opts.cfg, agent, { knownLoopbackUrls: known });
-  if (!peer || !peer.url) {
-    // Discovered-peer name lookup (local registry / mDNS). Ambiguous names
-    // error with the candidate URLs instead of guessing a target.
-    const matches = (opts.discoveredPeers ?? []).filter((d) => d.name === agent && d.url);
-    if (matches.length > 1) {
-      return (
-        `Error: ${matches.length} discovered peers share the name '${agent}' — ` +
-        `call by URL: ${matches.map((m) => m.url).join(", ")}`
-      );
-    }
-    if (matches.length === 1) {
-      // ponytail: re-resolve via the URL branch so loopback-token/SSRF policy is inherited verbatim
-      peer = resolvePeer(opts.cfg, matches[0]!.url, { knownLoopbackUrls: known });
-    }
-  }
-  if (!peer || !peer.url) {
-    return (
-      `Error: unknown agent '${agent}'. Configure it under 'a2a.peers' in ` +
-      `settings.json, pass a full http(s):// URL, or use a name from a2a_peers.`
-    );
-  }
+  const resolved = resolveCallPeer(opts.cfg, opts.piDir, agent, opts.discoveredPeers);
+  if ("error" in resolved) return resolved.error;
+  const peer = resolved.peer;
   let result: SendResult;
   try {
     result = await sendTask({
@@ -542,10 +584,7 @@ export async function a2aCall(opts: {
       contextId: opts.contextId,
     });
   } catch (e: any) {
-    const msg = e?.message || String(e);
-    if (/HTTP 401|HTTP 403/.test(msg)) return `Error: peer '${agent}' rejected auth. Check the configured token.`;
-    if (/HTTP 429/.test(msg)) return `Error: peer '${agent}' rate limited us (HTTP 429). Retry later.`;
-    return `Error: call to '${agent}' failed — ${msg}`;
+    return callErrorText(agent, e);
   }
   let header = `[A2A → ${agent} · context ${result.contextId}`;
   if (result.state) header += ` · ${shortState(result.state)}`;
@@ -557,6 +596,125 @@ export async function a2aCall(opts: {
       `with context_id '${result.contextId}'.)`;
   }
   return `${header}\n${body}`;
+}
+
+// ---------------------------------------------------------------------------
+// Non-blocking dispatch + polling (#22)
+// ---------------------------------------------------------------------------
+
+/** tasks/get against a peer — same transport, auth, and SSRF pin as sendTask. */
+async function getTask(opts: {
+  cfg: A2AConfig;
+  peer: Peer;
+  agentLabel: string;
+  taskId: string;
+}): Promise<any> {
+  const { cfg, peer, agentLabel, taskId } = opts;
+  const headers = buildPeerHeaders(cfg, peer, agentLabel);
+  const timeout = peer.timeout || cfg.timeouts.async;
+  // Best-effort card fetch (to learn the rpc URL); gateway peers stay pinned
+  // to the proxy URL, same as sendTask.
+  let card: AgentCard | null = null;
+  if (!peer.viaGateway) {
+    try {
+      card = await fetchCard(peer.url, headers, Math.min(timeout, 30000));
+    } catch {
+      /* tolerate */
+    }
+  }
+  const rpcBody: JsonRpcRequest = {
+    jsonrpc: "2.0",
+    id: newTaskId(),
+    method: "tasks/get",
+    params: { id: taskId },
+  };
+  const resp = await postJsonRpc(rpcUrl(peer.url, card), rpcBody, headers, timeout, gatewayOriginsForPeer(cfg, peer));
+  if (resp.error) {
+    const code = resp.error.code;
+    const msg = resp.error.message || JSON.stringify(resp.error);
+    if (code === -32001) throw new Error("task not found");
+    throw new Error(`peer '${agentLabel}' returned an error: ${msg}`);
+  }
+  return resp.result ?? {};
+}
+
+export async function a2aSend(opts: {
+  cfg: A2AConfig;
+  piDir: string;
+  agent: string;
+  message: string;
+  contextId?: string;
+  /** Live discovered peers (listPeers output) — lets local/mDNS peers be called by name. */
+  discoveredPeers?: DiscoveredPeer[];
+}): Promise<string> {
+  const agent = (opts.agent || "").trim();
+  const message = (opts.message || "").trim();
+  if (!agent || !message) return "Error: both 'agent' and 'message' are required.";
+  const resolved = resolveCallPeer(opts.cfg, opts.piDir, agent, opts.discoveredPeers);
+  if ("error" in resolved) return resolved.error;
+  let result: SendResult;
+  try {
+    result = await sendTask({
+      cfg: opts.cfg,
+      piDir: opts.piDir,
+      peer: resolved.peer,
+      agentLabel: agent,
+      message,
+      contextId: opts.contextId,
+      blocking: false,
+    });
+  } catch (e: any) {
+    return callErrorText(agent, e);
+  }
+  const header = `[A2A → ${agent} · context ${result.contextId} · ${shortState(result.state) || "submitted"}]`;
+  // A very fast peer may already be terminal — surface the reply directly.
+  if (result.state === "TASK_STATE_COMPLETED" || result.state === "TASK_STATE_FAILED" || result.state === "TASK_STATE_INPUT_REQUIRED") {
+    return `${header}\n${result.reply || "(no text reply)"}`;
+  }
+  return (
+    `${header}\n` +
+    `Task ${result.taskId || "(no id returned)"} accepted for background execution. ` +
+    `Poll with a2a_task(agent '${agent}', task_id '${result.taskId}').`
+  );
+}
+
+export async function a2aTask(opts: {
+  cfg: A2AConfig;
+  piDir: string;
+  agent: string;
+  taskId: string;
+  /** Live discovered peers (listPeers output) — lets local/mDNS peers be called by name. */
+  discoveredPeers?: DiscoveredPeer[];
+}): Promise<string> {
+  const agent = (opts.agent || "").trim();
+  const taskId = (opts.taskId || "").trim();
+  if (!agent || !taskId) return "Error: both 'agent' and 'task_id' are required.";
+  const resolved = resolveCallPeer(opts.cfg, opts.piDir, agent, opts.discoveredPeers);
+  if ("error" in resolved) return resolved.error;
+  let task: any;
+  try {
+    task = await getTask({ cfg: opts.cfg, peer: resolved.peer, agentLabel: agent, taskId });
+  } catch (e: any) {
+    if (/task not found/.test(e?.message || "")) {
+      return `Error: task '${taskId}' not found on peer '${agent}' (unknown id, foreign identity, or already evicted).`;
+    }
+    return callErrorText(agent, e);
+  }
+  const state = normalizeState(task?.status?.state);
+  const ctx = String(task?.contextId ?? "");
+  const reply = replyTextFromResult(task);
+  const header = `[A2A ← ${agent} · task ${taskId}${ctx ? ` · context ${ctx}` : ""}${state ? ` · ${shortState(state)}` : ""}]`;
+  if (state === "TASK_STATE_COMPLETED") {
+    if (reply) persistMessage({ piDir: opts.piDir, contextId: ctx || newContextId(), role: "agent", text: reply, taskId, peer: agent });
+    metrics.tasksCompleted += 1;
+    return `${header}\n${reply || "(no text reply)"}`;
+  }
+  if (state === "TASK_STATE_FAILED" || state === "TASK_STATE_CANCELED" || state === "TASK_STATE_REJECTED") {
+    if (reply) persistMessage({ piDir: opts.piDir, contextId: ctx || newContextId(), role: "agent", text: reply, taskId, peer: agent });
+    metrics.tasksFailed += 1;
+    return `${header}\n${reply || `(task ended ${shortState(state)} with no message)`}`;
+  }
+  return `${header}\nStill running — poll again later.`;
 }
 
 /** Build the set of loopback URLs that are KNOWN peers (same-machine, same-user):

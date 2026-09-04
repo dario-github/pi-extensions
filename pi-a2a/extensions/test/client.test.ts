@@ -7,6 +7,8 @@ import {
   a2aDiscover,
   a2aList,
   a2aOrchestrate,
+  a2aSend,
+  a2aTask,
   isPrivateHost,
   metrics,
   rpcUrl,
@@ -360,6 +362,87 @@ describe("client", () => {
       await a2aCall({ cfg, piDir, agent: "bob", message: "my key is sk-1234567890abcdefXX" });
       assert.notInclude(capturedBody, "sk-1234567890abcdefXX");
       assert.include(capturedBody, "sk-[redacted]");
+    });
+  });
+
+  describe("a2aSend / a2aTask — non-blocking dispatch (#22)", () => {
+    function cfgWithBob(): ReturnType<typeof DEFAULTS> {
+      const cfg = DEFAULTS();
+      cfg.peers.bob = { url: "http://b", auth: { type: "none" }, timeout: 5000, capabilities: [] };
+      return cfg;
+    }
+
+    it("a2aSend submits with configuration.blocking=false and returns the task handle", async () => {
+      let sentBody: any = null;
+      globalThis.fetch = (async (url: string, init?: any) => {
+        if (init?.method === "POST") {
+          sentBody = JSON.parse(init.body);
+          return makeResp({
+            jsonrpc: "2.0",
+            id: sentBody.id,
+            result: { task: { id: "task-9", contextId: "ctx-9", status: { state: "TASK_STATE_WORKING" } } },
+          }, 200);
+        }
+        return makeResp(null, 200); // card fetch
+      }) as any;
+      const out = await a2aSend({ cfg: cfgWithBob(), piDir, agent: "bob", message: "long job" });
+      assert.equal(sentBody?.method, "SendMessage");
+      assert.equal(sentBody?.params?.configuration?.blocking, false, "must request non-blocking execution");
+      assert.include(out, "task-9");
+      assert.include(out, "ctx-9");
+      assert.include(out, "working");
+      assert.include(out, "a2a_task", "the reply teaches the polling handle");
+    });
+
+    it("a2aTask polls tasks/get and surfaces the terminal reply", async () => {
+      let method = "";
+      let polledId = "";
+      globalThis.fetch = (async (url: string, init?: any) => {
+        if (init?.method === "POST") {
+          const body = JSON.parse(init.body);
+          method = body.method;
+          polledId = String(body.params?.id ?? "");
+          return makeResp({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              id: "task-9",
+              contextId: "ctx-9",
+              status: { state: STATE_COMPLETED },
+              artifacts: [{ parts: [{ text: "the answer" }] }],
+            },
+          }, 200);
+        }
+        return makeResp(null, 200);
+      }) as any;
+      const out = await a2aTask({ cfg: cfgWithBob(), piDir, agent: "bob", taskId: "task-9" });
+      assert.equal(method, "tasks/get");
+      assert.equal(polledId, "task-9");
+      assert.include(out, "completed");
+      assert.include(out, "the answer");
+    });
+
+    it("a2aTask reports a still-running task without a reply", async () => {
+      globalThis.fetch = (async (_url: string, init?: any) => {
+        if (init?.method === "POST") {
+          const body = JSON.parse(init.body);
+          return makeResp({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: { id: "task-9", contextId: "ctx-9", status: { state: "TASK_STATE_WORKING" } },
+          }, 200);
+        }
+        return makeResp(null, 200);
+      }) as any;
+      const out = await a2aTask({ cfg: cfgWithBob(), piDir, agent: "bob", taskId: "task-9" });
+      assert.include(out, "working");
+      assert.notInclude(out, "the answer");
+    });
+
+    it("a2aTask maps -32001 to a clear not-found error", async () => {
+      globalThis.fetch = mockFetch({ rpcError: { code: -32001, message: "task not found" } }) as any;
+      const out = await a2aTask({ cfg: cfgWithBob(), piDir, agent: "bob", taskId: "task-nope" });
+      assert.include(out, "not found");
     });
   });
 

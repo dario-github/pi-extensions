@@ -24,6 +24,8 @@ import {
   a2aHistory,
   a2aList,
   a2aOrchestrate,
+  a2aSend,
+  a2aTask,
   metrics,
 } from "./lib/client";
 import { A2AServer, type SessionRunner } from "./lib/server";
@@ -336,6 +338,9 @@ const contextIdParam = Type.Optional(
       "Context id from a prior call — reuse for multi-turn conversations. Omit for a new conversation.",
   }),
 );
+const taskIdParam = Type.String({
+  description: "Task id returned by a2a_send — the polling handle for a background task.",
+});
 
 // ---------------------------------------------------------------------------
 // Extension entrypoint
@@ -405,6 +410,77 @@ export default function a2aExtension(pi: ExtensionAPI): void {
               agent: String(args.agent ?? ""),
               message: String(args.message ?? ""),
               contextId: args.context_id ? String(args.context_id) : undefined,
+              discoveredPeers: listPeers({ cfg, piDir: piDir(), mdnsPeers: server?.discoveredMdnsPeers ?? [], selfUrl: server?.url ?? "", gatewayPeers: getGatewayPeers() }),
+            }),
+          },
+        ],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_send",
+    label: "A2A Send (non-blocking)",
+    description:
+      "Submit a task to a remote A2A agent WITHOUT waiting for it to finish (A2A v1.0 " +
+      "configuration.blocking=false). Returns a task id immediately; the peer executes in " +
+      "the background (bounded by its taskTimeoutSec, not the reply timeout), so use this " +
+      "for long-running work (multi-minute generation, batch jobs). Poll the result with a2a_task.",
+    promptSnippet: "submit a long task to a remote A2A agent and poll for the result later",
+    promptGuidelines: [
+      "Prefer a2a_send over a2a_call for anything that may run longer than a couple of minutes.",
+      "The reply returns a task id — poll it with a2a_task until the state is terminal.",
+    ],
+    parameters: Type.Object({
+      agent: agentParam,
+      message: messageParam,
+      context_id: contextIdParam,
+    }),
+    execute: async (_id, args, _signal, _onUpdate, ctx) => {
+      const cfg = cfgFor(ctx);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: await a2aSend({
+              cfg,
+              piDir: piDir(),
+              agent: String(args.agent ?? ""),
+              message: String(args.message ?? ""),
+              contextId: args.context_id ? String(args.context_id) : undefined,
+              discoveredPeers: listPeers({ cfg, piDir: piDir(), mdnsPeers: server?.discoveredMdnsPeers ?? [], selfUrl: server?.url ?? "", gatewayPeers: getGatewayPeers() }),
+            }),
+          },
+        ],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_task",
+    label: "A2A Task Status",
+    description:
+      "Poll a background task submitted with a2a_send (tasks/get). Returns the task state " +
+      "and, once terminal, the final reply/artifact. Ownership is per-identity: you can only " +
+      "poll tasks you submitted.",
+    promptSnippet: "poll a background A2A task for its result",
+    parameters: Type.Object({
+      agent: agentParam,
+      task_id: taskIdParam,
+    }),
+    execute: async (_id, args, _signal, _onUpdate, ctx) => {
+      const cfg = cfgFor(ctx);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: await a2aTask({
+              cfg,
+              piDir: piDir(),
+              agent: String(args.agent ?? ""),
+              taskId: String(args.task_id ?? ""),
               discoveredPeers: listPeers({ cfg, piDir: piDir(), mdnsPeers: server?.discoveredMdnsPeers ?? [], selfUrl: server?.url ?? "", gatewayPeers: getGatewayPeers() }),
             }),
           },
