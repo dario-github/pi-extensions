@@ -1206,6 +1206,36 @@ describe("server", () => {
     });
   });
 
+  describe("auto name is pinned for the server lifetime (#724)", () => {
+    it("hostname change after start does not move registry / card / name", async () => {
+      let host = "mbp-one.local";
+      const cfg = DEFAULTS();
+      cfg.server.agentName = ""; // unpinned → auto name <host>-<port>
+      const port = await freePort();
+      cfg.server = { ...cfg.server, port };
+      const piDir = tmpDir();
+      const server = new A2AServer({ cfg, cwd: tmpDir(), piDir, runner: stubRunner(), hostname: () => host });
+      const info = await server.start();
+      try {
+        const expected = `mbp-one-${info.port}`;
+        assert.equal(server.name, expected);
+        const card0 = await (await fetch(new URL("/.well-known/agent-card.json", info.url))).json();
+        assert.equal(card0.name, expected);
+        // Hostname flips underneath the running session (DHCP / .local rename).
+        host = "renamed-box.local";
+        server.refreshDescriptor(); // what the heartbeat / model_select path does
+        assert.equal(server.name, expected, "session name stays pinned");
+        const card1 = await (await fetch(new URL("/.well-known/agent-card.json", info.url))).json();
+        assert.equal(card1.name, expected, "Agent Card stays pinned");
+        const reg = listRegistry({ piDir, ttlSec: 60 }).find((d) => d.url === info.url || d.url.endsWith(`:${info.port}`));
+        assert.exists(reg, "registry descriptor exists");
+        assert.equal(reg!.agentName, expected, "registry descriptor stays pinned");
+      } finally {
+        await server.stop();
+      }
+    });
+  });
+
   describe("reply timeout classifies as FAILED (not CANCELED)", () => {
     it("times out a slow task to STATE_FAILED", async () => {
       const cfg = DEFAULTS();

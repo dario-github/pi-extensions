@@ -206,6 +206,12 @@ export class A2AServer {
   private running = 0; // concurrency counter (bounded by cfg.server.maxConcurrent)
   // Discovery state (0.2.0)
   private descriptor: SessionDescriptor | null = null;
+  private readonly hostnameOf: () => string;
+  /** Auto name computed ONCE per server lifetime (#724): registry descriptor,
+   *  Agent Card and gateway registration must all say the same thing even if
+   *  the hostname changes underneath a long-running session. null until
+   *  start() has bound a port; cleared by stop(). */
+  private pinnedName: string | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private mdnsBroadcast: MdnsHandle | null = null;
   private mdnsDiscovery: MdnsHandle | null = null;
@@ -253,8 +259,11 @@ export class A2AServer {
     /** Gateway diagnostic lines (register failed, channel dropped, …) — kept
      * OFF the status surface so they never interleave with lifecycle lines. */
     onError?: (msg: string) => void;
+    /** Hostname source for the auto name (tests inject a mutable one). */
+    hostname?: () => string;
   }) {
     this.cfg = opts.cfg;
+    this.hostnameOf = opts.hostname ?? hostname;
     this.ctx = opts.ctx;
     this.api = opts.api;
     this.onActivity = opts.onActivity;
@@ -305,10 +314,11 @@ export class A2AServer {
    *  convention (`<base>-<port>`). `.local`/`.LAN` mDNS suffixes stripped for
    *  cleaner names (MBP-Sao.local → mbp-sao). */
   private baseName(): string {
-    return cleanHostName(hostname());
+    return cleanHostName(this.hostnameOf());
   }
 
   private sessionName(): string {
+    if (this.pinnedName) return this.pinnedName;
     return this.cfg.server.agentName || `${this.baseName()}-${this.boundPort ?? this.cfg.server.port}`;
   }
 
@@ -610,6 +620,9 @@ export class A2AServer {
         });
         this.http = srv;
         this.boundPort = (srv.address() as { port: number })?.port ?? port;
+        // Pin the identity for this server lifetime (#724) — everything
+        // downstream (descriptor, card, gateway) reads sessionName().
+        this.pinnedName = this.cfg.server.agentName || `${this.baseName()}-${this.boundPort}`;
         await this.startDiscovery();
         await this.startGatewayUpstream();
         return { host, port: this.boundPort, url: this.publicUrl() };
@@ -654,6 +667,7 @@ export class A2AServer {
     });
     this.http = null;
     this.boundPort = null;
+    this.pinnedName = null;
     await this.stopGatewayUpstream();
     await this.stopDiscovery();
   }
