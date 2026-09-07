@@ -32,7 +32,7 @@ export function DEFAULTS(): A2AConfig {
       mdns: { enabled: false, serviceType: "a2a" },
       enrichCard: true,
     },
-    inbound: { visibility: "signal" },
+    inbound: { visibility: "signal", wake: "auto", wakeMergeSec: 300 },
     ui: { transcript: true, transcriptTools: false },
   };
 }

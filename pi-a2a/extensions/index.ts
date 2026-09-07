@@ -32,7 +32,7 @@ import {
 import { A2AServer, type SessionRunner } from "./lib/server";
 import { formatPeers, listPeers } from "./lib/discovery";
 import { activityLine, activityStatusLine, activityToText, classifyLine, dispatchLabel, isToolNoise, preview, type InboundActivity } from "./lib/activity";
-import { appendInbox, digestUnread, readInbox, type InboxEntry } from "./lib/inbox";
+import { appendInbox, digestUnread, readInbox, WakeCoalescer, type InboxEntry } from "./lib/inbox";
 import { openPanel, type PanelAction } from "./lib/config-panel";
 
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -246,6 +246,9 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
     }
     let reply = "";
     let inputRequired = false;
+    // The child says this outcome needs the principal (ruling / budget /
+    // truth-source / schedule) — the only thing allowed to wake the host.
+    let needsPrincipal = false;
     // Stop reason of the LAST assistant message and whether it carried any
     // text — consumed by the stunted-reply check after the run completes.
     let terminalStopReason: string | undefined;
@@ -272,6 +275,10 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
         if (/\[INPUT_REQUIRED\]/i.test(reply)) {
           inputRequired = true;
           reply = reply.replace(/\[INPUT_REQUIRED\]\s*/gi, "").trim();
+        }
+        if (/\[NEEDS_PRINCIPAL\]/i.test(reply)) {
+          needsPrincipal = true;
+          reply = reply.replace(/\[NEEDS_PRINCIPAL\]\s*/gi, "").trim();
         }
       }
     });
@@ -334,7 +341,7 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
         "run ended on a length stop with no assistant text — no usable reply was produced (output capped before any content; context-clamped max_tokens?)",
       );
     }
-    return { reply: reply || "(no reply)", inputRequired };
+    return { reply: reply || "(no reply)", inputRequired, needsPrincipal };
   };
 }
 
@@ -349,6 +356,43 @@ const activeInboundTasks = new Map<string, { identity: string; last: InboundActi
 // runner), and the per-process "read up to" cursor for the turn-boundary digest.
 const inboundSessionFiles = new Map<string, string>();
 let inboxCursorTs = new Date().toISOString();
+
+/** mode column (event | heartbeat) of the workstation whose registered path
+ *  contains cwd, else null. Same lookup as workstationForCwd. */
+function workstationModeForCwd(cwd: string): string | null {
+  try {
+    let dir = resolve(cwd);
+    for (;;) {
+      const tsv = join(dir, "workstations.tsv");
+      if (existsSync(tsv)) {
+        let best: { mode: string; len: number } | null = null;
+        for (const line of readFileSync(tsv, "utf-8").split("\n")) {
+          if (!line || line.startsWith("#")) continue;
+          const cols = line.split("\t");
+          if (cols.length < 6) continue;
+          const [, , host, p, , mode] = cols;
+          if (host !== "mac" || !p || p.startsWith("~")) continue;
+          const abs = resolve(dir, p);
+          if ((resolve(cwd) === abs || resolve(cwd).startsWith(abs + "/")) && (!best || abs.length > best.len)) best = { mode: (mode ?? "").trim(), len: abs.length };
+        }
+        return best?.mode ?? null;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      dir = parent;
+    }
+  } catch {
+    return null;
+  }
+}
+
+function wakeEnabled(cfg: A2AConfig | undefined): boolean {
+  const w = cfg?.inbound?.wake ?? "auto";
+  if (w === true || w === false) return w;
+  return workstationModeForCwd(process.cwd()) === "heartbeat";
+}
+
+let wakeCoalescer: WakeCoalescer | null = null;
 
 /** Seat key for the on-disk inbox: workstation name from workstations.tsv when
  *  the cwd sits under one, else the pinned agent name minus the uniqueness
@@ -404,9 +448,26 @@ function broadcastActivity(
       elapsedMs: a.elapsedMs,
       ...(a.type === "failed" ? { error: a.error } : {}),
       ...(inboundSessionFiles.has(a.taskId) ? { sessionFile: inboundSessionFiles.get(a.taskId) } : {}),
+      ...(a.type === "completed" && a.needsPrincipal ? { needsPrincipal: true } : {}),
     };
     appendInbox(piDir(), inboxSeat(cfg), entry);
     inboundSessionFiles.delete(a.taskId);
+    // #27 E: needs-principal outcomes wake the host — idle → a turn starts now,
+    // busy → delivered after the current turn settles. One wake per merge
+    // window; the wake carries the SAME folded digest and advances the cursor
+    // so before_agent_start does not repeat it.
+    if (entry.needsPrincipal && wakeEnabled(cfg) && visibility !== "silent") {
+      wakeCoalescer ??= new WakeCoalescer(Math.max(1, cfg?.inbound?.wakeMergeSec ?? 300) * 1000, (batch) => {
+        const unread = readInbox(piDir(), inboxSeat(cfg), { sinceTs: inboxCursorTs });
+        const entries = unread.length ? unread : batch;
+        inboxCursorTs = entries.reduce((m, e) => (e.ts > m ? e.ts : m), inboxCursorTs);
+        pi.sendMessage(
+          { customType: "a2a-inbox", content: digestUnread(entries, { max: 5 }), display: true },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      });
+      wakeCoalescer.push(entry);
+    }
   }
   if (!ctx) return;
   switch (a.type) {

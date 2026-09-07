@@ -61,6 +61,15 @@ session's context. You learn about it through two bounded channels:
   `a2a_inbox(task_id)` returns the full reply when this process still holds it,
   else the child-session transcript path under `<piDir>/a2a_inbound_sessions/`.
 
+**If you are the child session answering an inbound task** and the outcome
+needs the seat's principal (a ruling, a budget approval, a truth-source or
+schedule change — NOT fact lookups, receipts or registrations), end your reply
+with the literal marker `[NEEDS_PRINCIPAL]`. It is stripped from the reply and
+flags the inbox row; on heartbeat seats (or `a2a.inbound.wake = true`) that
+row wakes the host — idle → a turn starts now, busy → delivered after the
+current turn settles — at most once per `a2a.inbound.wakeMergeSec` (default
+300s). Everything else waits for the host's natural next turn.
+
 When a user asks "what came in over a2a?" or a digest appears, call `a2a_inbox`
 before answering. The child already did the work — read its outcome, do not
 redo it. Set `a2a.inbound.visibility` to `silent` (pull only) or `full`

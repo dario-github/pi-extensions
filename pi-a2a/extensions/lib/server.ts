@@ -182,7 +182,7 @@ export interface SessionRunner {
     /** Server task id — lets the runner correlate its child session with the
      *  task (inbox sessionFile, #27). */
     taskId?: string;
-  }): Promise<{ reply: string; inputRequired: boolean }>;
+  }): Promise<{ reply: string; inputRequired: boolean; needsPrincipal?: boolean }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +995,7 @@ export class A2AServer {
         state: finalState,
         replyPreview: preview(reply),
         elapsedMs: Date.now() - startedAt,
+        ...(out.needsPrincipal ? { needsPrincipal: true } : {}),
       });
       return st.task; // bare Task as the JSON-RPC result (legacy-compatible)
     } catch (e: any) {

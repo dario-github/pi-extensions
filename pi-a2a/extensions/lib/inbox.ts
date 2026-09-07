@@ -27,6 +27,10 @@ export interface InboxEntry {
   error?: string;
   /** Detached child-session transcript path, when known. */
   sessionFile?: string;
+  /** The child flagged this outcome as needing the principal (a ruling,
+   *  budget approval, truth-source or schedule change) — the only class of
+   *  entry allowed to wake the host (#27 E). */
+  needsPrincipal?: boolean;
 }
 
 const MAX_READ_BYTES = 2 * 1024 * 1024; // ponytail: tail-read cap; rotate when a seat outgrows this
@@ -106,8 +110,71 @@ export function digestUnread(entries: InboxEntry[], opts: { max: number }): stri
   for (const e of entries.slice(0, opts.max)) {
     const secs = (e.elapsedMs / 1000).toFixed(0);
     const tail = e.state === "TASK_STATE_FAILED" && e.error ? ` — ${safe(e.error, 80)}` : "";
-    lines.push(`- ${e.taskId} from ${safe(e.identity)} · ${shortState(e.state)} · ${secs}s${tail}`);
+    const flag = e.needsPrincipal ? " · ⚑ needs principal" : "";
+    lines.push(`- ${e.taskId} from ${safe(e.identity)} · ${shortState(e.state)} · ${secs}s${flag}${tail}`);
   }
   if (entries.length > opts.max) lines.push(`  … and ${entries.length - opts.max} more (a2a_inbox() lists them)`);
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Wake coalescer (#27 E): "idle → deliver now, busy → wait" is the host's
+// job (sendMessage followUp + triggerTurn); ours is to make sure a burst of
+// needs_principal outcomes wakes the principal ONCE per merge window
+// (leading edge + one trailing flush), so a 5-minute window costs at most one
+// prompt-cache miss.
+// ---------------------------------------------------------------------------
+
+export class WakeCoalescer {
+  private pending: InboxEntry[] = [];
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private windowOpen = false;
+
+  constructor(
+    private readonly windowMs: number,
+    private readonly send: (entries: InboxEntry[]) => void,
+  ) {}
+
+  /** Queue an entry. Fires immediately when no window is open; otherwise the
+   *  entry rides the trailing flush at window end. */
+  push(e: InboxEntry): void {
+    this.pending.push(e);
+    if (!this.windowOpen) {
+      this.flush();
+      this.windowOpen = true;
+      this.timer = setTimeout(() => this.onWindowEnd(), this.windowMs);
+      this.timer.unref?.();
+    }
+  }
+
+  private onWindowEnd(): void {
+    this.timer = null;
+    if (this.pending.length > 0) {
+      // Trailing flush opens a fresh window so a steady stream stays at one
+      // wake per window.
+      this.flush();
+      this.timer = setTimeout(() => this.onWindowEnd(), this.windowMs);
+      this.timer.unref?.();
+    } else {
+      this.windowOpen = false;
+    }
+  }
+
+  private flush(): void {
+    const batch = this.pending;
+    this.pending = [];
+    try {
+      this.send(batch);
+    } catch {
+      /* wake is best-effort */
+    }
+  }
+
+  /** Test/shutdown hook. */
+  dispose(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.pending = [];
+    this.windowOpen = false;
+  }
 }

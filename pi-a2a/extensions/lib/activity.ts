@@ -23,7 +23,7 @@ export type InboundActivity =
       contextId: string;
     }
   | { type: "progress"; taskId: string; line: string }
-  | { type: "completed"; taskId: string; state: string; replyPreview: string; elapsedMs: number }
+  | { type: "completed"; taskId: string; state: string; replyPreview: string; elapsedMs: number; needsPrincipal?: boolean }
   | { type: "failed"; taskId: string; error: string; elapsedMs: number };
 
 // ---------------------------------------------------------------------------

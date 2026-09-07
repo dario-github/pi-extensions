@@ -2,7 +2,7 @@ import { assert } from "chai";
 import { readFileSync, existsSync, appendFileSync } from "node:fs";
 
 import { makeTempDir } from "./tmp";
-import { appendInbox, readInbox, digestUnread, inboxPath, type InboxEntry } from "../lib/inbox";
+import { appendInbox, readInbox, digestUnread, inboxPath, WakeCoalescer, type InboxEntry } from "../lib/inbox";
 
 function entry(i: number, over: Partial<InboxEntry> = {}): InboxEntry {
   return {
@@ -63,5 +63,40 @@ describe("inbox (#27 inbound visibility)", () => {
 
   it("digestUnread returns empty for no entries", () => {
     assert.equal(digestUnread([], { max: 5 }), "");
+  });
+
+  describe("WakeCoalescer (#27 E: one wake per merge window)", () => {
+    const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    it("fires immediately on the first entry (idle principal is woken at once)", () => {
+      const sent: InboxEntry[][] = [];
+      const w = new WakeCoalescer(200, (b) => sent.push(b));
+      w.push(entry(1, { needsPrincipal: true }));
+      assert.lengthOf(sent, 1);
+      assert.equal(sent[0]![0]!.taskId, "task-1");
+      w.dispose();
+    });
+
+    it("N entries inside the window collapse into one trailing wake", async () => {
+      const sent: InboxEntry[][] = [];
+      const w = new WakeCoalescer(120, (b) => sent.push(b));
+      w.push(entry(1, { needsPrincipal: true }));
+      w.push(entry(2, { needsPrincipal: true }));
+      w.push(entry(3, { needsPrincipal: true }));
+      assert.lengthOf(sent, 1, "only the leading edge so far");
+      await tick(180);
+      assert.lengthOf(sent, 2, "one trailing flush for the burst");
+      assert.deepEqual(sent[1]!.map((e) => e.taskId), ["task-2", "task-3"]);
+      await tick(180);
+      assert.lengthOf(sent, 2, "quiet window closes without a spurious wake");
+      w.push(entry(4, { needsPrincipal: true }));
+      assert.lengthOf(sent, 3, "next entry after a closed window fires immediately again");
+      w.dispose();
+    });
+
+    it("digest marks needs-principal rows", () => {
+      const d = digestUnread([entry(1, { needsPrincipal: true })], { max: 5 });
+      assert.include(d, "needs principal");
+    });
   });
 });

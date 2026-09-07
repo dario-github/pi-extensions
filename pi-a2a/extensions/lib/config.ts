@@ -152,7 +152,16 @@ export interface A2AConfig {
    *  silent = nothing (pull via a2a_inbox only); signal = one bounded
    *  metadata digest at the next turn boundary (default); full = every
    *  activity line as a persisted message (debugging; noisy, breaks cache). */
-  inbound: { visibility: "silent" | "signal" | "full" };
+  inbound: {
+    visibility: "silent" | "signal" | "full";
+    /** Wake the host (sendMessage followUp + triggerTurn) when an inbound
+     *  outcome is flagged needs-principal. "auto" = on for heartbeat seats
+     *  (workstations.tsv mode column), off for event seats (#27 E). */
+    wake: boolean | "auto";
+    /** Merge window: at most one wake per window (leading + one trailing).
+     *  Default 300s — aligned with the prompt-cache TTL. */
+    wakeMergeSec: number;
+  };
   /** Host-TUI presentation (0.3.0). */
   ui: {
     /** Show inbound task activity as transcript messages (default true). When
@@ -196,7 +205,7 @@ const DEFAULTS: A2AConfig = {
     gateway: undefined,
     enrichCard: true,
   },
-  inbound: { visibility: "signal" },
+  inbound: { visibility: "signal", wake: "auto", wakeMergeSec: 300 },
   ui: { transcript: true, transcriptTools: false },
 };
 
@@ -547,6 +556,9 @@ export function loadConfig(opts: {
   const inbound = (s.inbound && typeof s.inbound === "object" ? s.inbound : {}) as Record<string, any>;
   const vis = String(inbound.visibility ?? env.A2A_INBOUND_VISIBILITY ?? DEFAULTS.inbound.visibility);
   cfg.inbound.visibility = vis === "silent" || vis === "full" ? vis : "signal";
+  const wakeRaw = inbound.wake ?? env.A2A_INBOUND_WAKE;
+  cfg.inbound.wake = wakeRaw === undefined || wakeRaw === "auto" ? "auto" : bool(wakeRaw, false);
+  cfg.inbound.wakeMergeSec = num(inbound.wakeMergeSec ?? env.A2A_INBOUND_WAKE_MERGE_SEC, DEFAULTS.inbound.wakeMergeSec);
 
   // Live in-memory overrides (set by the /a2a-config panel) — highest
   // precedence, above env + settings.json, so panel edits apply immediately
