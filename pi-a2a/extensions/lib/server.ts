@@ -179,6 +179,9 @@ export interface SessionRunner {
     message: string;
     signal: AbortSignal;
     onProgress?: (assistantTextDelta: string) => void;
+    /** Server task id — lets the runner correlate its child session with the
+     *  task (inbox sessionFile, #27). */
+    taskId?: string;
   }): Promise<{ reply: string; inputRequired: boolean }>;
 }
 
@@ -672,6 +675,17 @@ export class A2AServer {
     return this.sessionName();
   }
 
+  /** Read-only view of an inbound task held by this process (any identity —
+   *  this is the HOST's own inbox, not a peer-facing endpoint). Returns the
+   *  reply artifact text when terminal. (#27) */
+  inboundTask(id: string): { state: string; reply: string; contextId: string } | undefined {
+    const st = this.store.get(id);
+    if (!st) return undefined;
+    const t = st.task;
+    const reply = (t.artifacts ?? []).flatMap((a: any) => a.parts ?? []).map((p: any) => (typeof p.text === "string" ? p.text : "")).join("");
+    return { state: t.status.state, reply, contextId: String(t.contextId ?? "") };
+  }
+
   /** For tests: how many tasks are currently running. */
   get runningCount(): number {
     return this.running;
@@ -935,6 +949,7 @@ export class A2AServer {
         message: wrapped,
         signal: controller.signal,
         onProgress: (line) => this.onActivity?.({ type: "progress", taskId, line }),
+        taskId,
       });
       // The abort wins over a late resolve: a runner that ignores the signal
       // (or finishes concurrently with it) must NOT take the success path —

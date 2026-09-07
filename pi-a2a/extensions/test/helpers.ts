@@ -32,6 +32,7 @@ export function DEFAULTS(): A2AConfig {
       mdns: { enabled: false, serviceType: "a2a" },
       enrichCard: true,
     },
+    inbound: { visibility: "signal" },
     ui: { transcript: true },
   };
 }

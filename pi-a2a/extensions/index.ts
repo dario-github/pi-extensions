@@ -32,6 +32,7 @@ import {
 import { A2AServer, type SessionRunner } from "./lib/server";
 import { formatPeers, listPeers } from "./lib/discovery";
 import { activityLine, activityStatusLine, activityToText, classifyLine, dispatchLabel, preview, type InboundActivity } from "./lib/activity";
+import { appendInbox, digestUnread, readInbox, type InboxEntry } from "./lib/inbox";
 import { openPanel, type PanelAction } from "./lib/config-panel";
 
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -172,7 +173,7 @@ function registerInbound(cwd: string, sessionFile: string): (status: "done" | "a
 // ---------------------------------------------------------------------------
 
 function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
-  return async ({ message, signal, onProgress }) => {
+  return async ({ message, signal, onProgress, taskId }) => {
     const sdk = await import("@earendil-works/pi-coding-agent");
     const { createAgentSession, SessionManager, SettingsManager, DefaultResourceLoader } = sdk;
     const modelRegistry = ctx.modelRegistry as any;
@@ -288,6 +289,7 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
     signal.addEventListener("abort", onAbort, { once: true });
     const sessionFile = session.sessionManager?.getSessionFile?.() ?? "(unknown)";
     const finalizeInbound = registerInbound(cwd, sessionFile);
+    if (taskId) inboundSessionFiles.set(taskId, sessionFile);
     try {
       // Settle the race on prompt() completion, not on agent_end: agent_end
       // fires when the model turn ends — BEFORE the post-run overflow
@@ -341,7 +343,22 @@ function makeSessionRunner(ctx: ExtensionContext): SessionRunner {
 // ---------------------------------------------------------------------------
 
 /** In-flight inbound tasks (identity + taskId), for the footer status line. */
-const activeInboundTasks = new Map<string, { identity: string; last: InboundActivity }>();
+const activeInboundTasks = new Map<string, { identity: string; last: InboundActivity; contextId?: string }>();
+
+// #27 inbound inbox: taskId → detached child-session transcript (set by the
+// runner), and the per-process "read up to" cursor for the turn-boundary digest.
+const inboundSessionFiles = new Map<string, string>();
+let inboxCursorTs = new Date().toISOString();
+
+/** Seat key for the on-disk inbox: workstation name from workstations.tsv when
+ *  the cwd sits under one, else the pinned agent name minus the uniqueness
+ *  suffix pi-a2a appends (`-2`, `-yqrlu0`), else "default". */
+function inboxSeat(cfg: A2AConfig | undefined): string {
+  const ws = workstationForCwd(process.cwd());
+  if (ws) return ws;
+  const name = cfg?.server.agentName || "";
+  return name.replace(/-(\d+|[a-z0-9]{6})$/, "") || "default";
+}
 
 /**
  * Surface an inbound activity event to the host TUI.
@@ -357,22 +374,45 @@ function broadcastActivity(
   a: InboundActivity,
 ): void {
   const transcript = cfg?.ui?.transcript ?? true;
+  const visibility = cfg?.inbound?.visibility ?? "signal";
   if (transcript) {
     try {
-      pi.appendEntry("a2a-inbound", { text: activityToText(a) });
+      if (visibility === "full") {
+        // Debug mode: every activity line becomes a persisted message the
+        // host model sees (the pre-#722 behavior — noisy, breaks cache).
+        pi.sendMessage({ customType: "a2a-inbound", content: activityToText(a), display: true }, { deliverAs: "nextTurn" });
+      } else {
+        pi.appendEntry("a2a-inbound", { text: activityToText(a) });
+      }
     } catch {
       /* session may be mid-replace; ignore */
     }
   }
+  // #27: terminal events land in the on-disk inbox regardless of UI state —
+  // this is what a2a_inbox and the turn-boundary digest read.
+  if (a.type === "completed" || a.type === "failed") {
+    const entry: InboxEntry = {
+      ts: new Date().toISOString(),
+      taskId: a.taskId,
+      contextId: activeInboundTasks.get(a.taskId)?.contextId ?? "",
+      identity: activeInboundTasks.get(a.taskId)?.identity ?? "peer",
+      state: a.type === "completed" ? a.state : "TASK_STATE_FAILED",
+      elapsedMs: a.elapsedMs,
+      ...(a.type === "failed" ? { error: a.error } : {}),
+      ...(inboundSessionFiles.has(a.taskId) ? { sessionFile: inboundSessionFiles.get(a.taskId) } : {}),
+    };
+    appendInbox(piDir(), inboxSeat(cfg), entry);
+    inboundSessionFiles.delete(a.taskId);
+  }
   if (!ctx) return;
   switch (a.type) {
     case "arrived":
-      activeInboundTasks.set(a.taskId, { identity: a.identity, last: a });
+      activeInboundTasks.set(a.taskId, { identity: a.identity, last: a, contextId: a.contextId });
       // Toast stays short (it would flood the TUI); the transcript carries full text.
       ctx.ui.notify(`A2A dispatch from ${a.identity}: ${preview(a.text, 160)}`, "info");
       break;
     case "progress":
-      activeInboundTasks.set(a.taskId, { identity: activeInboundTasks.get(a.taskId)?.identity ?? "peer", last: a });
+      activeInboundTasks.set(a.taskId, { identity: activeInboundTasks.get(a.taskId)?.identity ?? "peer", last: a, contextId: activeInboundTasks.get(a.taskId)?.contextId });
       break;
     case "completed":
     case "failed":
@@ -614,6 +654,57 @@ export default function a2aExtension(pi: ExtensionAPI): void {
         ],
         details: {},
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_inbox",
+    label: "A2A Inbox",
+    description:
+      "Read this seat's INBOUND a2a history — tasks other agents sent to this session, which ran in " +
+      "detached child sessions. Without task_id: list recent inbound tasks (peer, state, elapsed). " +
+      "With task_id: the full reply text (if still held by this process) and the child-session transcript path.",
+    promptSnippet: "list or read inbound a2a tasks this seat received",
+    promptGuidelines: [
+      "When the user asks what a2a dispatches/messages arrived, or an [a2a-inbox] digest appeared, use a2a_inbox before answering.",
+      "Inbound work already ran in a child session — read its outcome; do not redo it.",
+    ],
+    parameters: Type.Object({
+      task_id: Type.Optional(Type.String({ description: "Inbound task id to read in full. Omit to list." })),
+      limit: Type.Optional(Type.Number({ description: "Max entries to list (default 10)." })),
+    }),
+    execute: async (_id, args, _signal, _onUpdate, ctx) => {
+      const cfg = cfgFor(ctx);
+      const seat = inboxSeat(cfg);
+      const taskId = args.task_id ? String(args.task_id) : "";
+      let text: string;
+      if (taskId) {
+        const e = readInbox(piDir(), seat, { taskId })[0];
+        const live = server?.inboundTask(taskId);
+        if (!e && !live) {
+          text = `No inbound task '${taskId}' in this seat's inbox (${seat}).`;
+        } else {
+          const lines = [
+            `[A2A inbound · task ${taskId}${e ? ` · from ${e.identity} · ${e.state.replace("TASK_STATE_", "").toLowerCase()} · ${(e.elapsedMs / 1000).toFixed(0)}s · ${e.ts}` : ""}]`,
+          ];
+          if (e?.contextId) lines.push(`context: ${e.contextId}`);
+          if (e?.error) lines.push(`error: ${e.error}`);
+          if (live?.reply) lines.push("", live.reply);
+          else lines.push("", e?.sessionFile ? `(reply not held by this process — read the child transcript: ${e.sessionFile})` : "(reply text unavailable: not held by this process and no transcript path recorded)");
+          if (live?.reply && e?.sessionFile) lines.push("", `transcript: ${e.sessionFile}`);
+          text = lines.join("\n");
+        }
+      } else {
+        const limit = Math.max(1, Math.min(50, Number(args.limit ?? 10) || 10));
+        const entries = readInbox(piDir(), seat, { limit });
+        if (entries.length === 0) text = `Inbox for seat '${seat}' is empty (no inbound a2a task has reached a terminal state).`;
+        else {
+          text = [`[A2A inbound · seat ${seat} · latest ${entries.length}]`]
+            .concat(entries.map((e) => `- ${e.taskId} · from ${e.identity} · ${e.state.replace("TASK_STATE_", "").toLowerCase()} · ${(e.elapsedMs / 1000).toFixed(0)}s · ${e.ts}${e.error ? ` — ${e.error}` : ""}`))
+            .join("\n");
+        }
+      }
+      return { content: [{ type: "text" as const, text }], details: {} };
     },
   });
 
@@ -1137,7 +1228,7 @@ export default function a2aExtension(pi: ExtensionAPI): void {
           "  /a2a-config show             Show config summary",
           "  /a2a-server start|stop|status  Manage inbound server",
           "",
-          "Tools: a2a_call, a2a_discover, a2a_list, a2a_history, a2a_orchestrate",
+          "Tools: a2a_call, a2a_send, a2a_task, a2a_inbox, a2a_discover, a2a_list, a2a_history, a2a_orchestrate",
         ].join("\n"),
         "info",
       );
@@ -1154,6 +1245,19 @@ export default function a2aExtension(pi: ExtensionAPI): void {
   });
 
   let lastA2aCtx: ExtensionContext | undefined;
+  // #27: turn-boundary digest. Inbound tasks run in detached child sessions;
+  // the host model learns about terminal outcomes exactly here — one bounded,
+  // metadata-only message per turn, injected where a new prompt already
+  // invalidates the cache. Never mid-turn, never a wake-up.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    const cfg = cfgFor(ctx);
+    if (cfg.inbound.visibility !== "signal") return;
+    const unread = readInbox(piDir(), inboxSeat(cfg), { sinceTs: inboxCursorTs });
+    if (unread.length === 0) return;
+    inboxCursorTs = unread[0]!.ts;
+    return { message: { customType: "a2a-inbox", content: digestUnread(unread, { max: 5 }), display: true } };
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     lastA2aCtx = ctx;
     // Only HOST sessions serve inbound A2A. SDK-created child sessions (a2a

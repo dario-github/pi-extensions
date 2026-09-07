@@ -147,6 +147,12 @@ export interface A2AConfig {
     gateways?: Record<string, GatewayEntry>;
     enrichCard: boolean;
   };
+  /** Inbound visibility for the HOST model (#27). Inbound tasks always run in
+   *  detached child sessions; this only governs what the host model learns:
+   *  silent = nothing (pull via a2a_inbox only); signal = one bounded
+   *  metadata digest at the next turn boundary (default); full = every
+   *  activity line as a persisted message (debugging; noisy, breaks cache). */
+  inbound: { visibility: "silent" | "signal" | "full" };
   /** Host-TUI presentation (0.3.0). */
   ui: {
     /** Show inbound task activity as transcript messages (default true). When
@@ -186,6 +192,7 @@ const DEFAULTS: A2AConfig = {
     gateway: undefined,
     enrichCard: true,
   },
+  inbound: { visibility: "signal" },
   ui: { transcript: true },
 };
 
@@ -404,6 +411,7 @@ export function loadConfig(opts: {
       mdns: { ...DEFAULTS.discovery.mdns },
       enrichCard: DEFAULTS.discovery.enrichCard,
     },
+    inbound: { ...DEFAULTS.inbound },
     ui: { ...DEFAULTS.ui },
   };
 
@@ -531,6 +539,9 @@ export function loadConfig(opts: {
   // Host-TUI presentation (0.3.0)
   const ui = (s.ui && typeof s.ui === "object" ? s.ui : {}) as Record<string, any>;
   cfg.ui.transcript = bool(ui.transcript ?? env.A2A_UI_TRANSCRIPT, DEFAULTS.ui.transcript);
+  const inbound = (s.inbound && typeof s.inbound === "object" ? s.inbound : {}) as Record<string, any>;
+  const vis = String(inbound.visibility ?? env.A2A_INBOUND_VISIBILITY ?? DEFAULTS.inbound.visibility);
+  cfg.inbound.visibility = vis === "silent" || vis === "full" ? vis : "signal";
 
   // Live in-memory overrides (set by the /a2a-config panel) — highest
   // precedence, above env + settings.json, so panel edits apply immediately
