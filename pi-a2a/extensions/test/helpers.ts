@@ -33,6 +33,6 @@ export function DEFAULTS(): A2AConfig {
       enrichCard: true,
     },
     inbound: { visibility: "signal" },
-    ui: { transcript: true },
+    ui: { transcript: true, transcriptTools: false },
   };
 }

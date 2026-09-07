@@ -158,6 +158,10 @@ export interface A2AConfig {
     /** Show inbound task activity as transcript messages (default true). When
      *  false, activity is still surfaced via notify() toasts + footer status. */
     transcript: boolean;
+    /** Also show the child session's tool-run lines (⚙ bash …, ✓ read) in the
+     *  transcript. Default false: only task arrival, assistant text and the
+     *  terminal line are shown — tool churn is interface noise (DC 2026-09-07). */
+    transcriptTools: boolean;
   };
 }
 
@@ -193,7 +197,7 @@ const DEFAULTS: A2AConfig = {
     enrichCard: true,
   },
   inbound: { visibility: "signal" },
-  ui: { transcript: true },
+  ui: { transcript: true, transcriptTools: false },
 };
 
 // ---------------------------------------------------------------------------
@@ -539,6 +543,7 @@ export function loadConfig(opts: {
   // Host-TUI presentation (0.3.0)
   const ui = (s.ui && typeof s.ui === "object" ? s.ui : {}) as Record<string, any>;
   cfg.ui.transcript = bool(ui.transcript ?? env.A2A_UI_TRANSCRIPT, DEFAULTS.ui.transcript);
+  cfg.ui.transcriptTools = bool(ui.transcriptTools ?? env.A2A_UI_TRANSCRIPT_TOOLS, DEFAULTS.ui.transcriptTools);
   const inbound = (s.inbound && typeof s.inbound === "object" ? s.inbound : {}) as Record<string, any>;
   const vis = String(inbound.visibility ?? env.A2A_INBOUND_VISIBILITY ?? DEFAULTS.inbound.visibility);
   cfg.inbound.visibility = vis === "silent" || vis === "full" ? vis : "signal";

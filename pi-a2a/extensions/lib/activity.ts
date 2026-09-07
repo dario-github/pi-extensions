@@ -164,6 +164,13 @@ export function classifyLine(content: string): A2ALineClass {
   return "executing"; // ⚙ tool runs, “✓ agent finished”, anything else mid-flight
 }
 
+/** Tool-run churn from the child session (⚙ bash …, ✓ read, "…done") — hidden
+ *  from the host transcript unless ui.transcriptTools is on. Arrival, assistant
+ *  text and terminal lines are never noise. */
+export function isToolNoise(content: string): boolean {
+  return classifyLine(content) === "executing";
+}
+
 /** Short footer status while dispatches are running (e.g. "A2A: 2 inbound dispatches (hermes)"). */
 export function activityStatusLine(active: Array<{ taskId: string; identity: string }>): string | undefined {
   if (active.length === 0) return undefined;

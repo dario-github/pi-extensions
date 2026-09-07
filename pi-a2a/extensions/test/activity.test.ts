@@ -8,6 +8,7 @@ import {
   dispatchLabel,
   preview,
   type InboundActivity,
+  isToolNoise,
 } from "../lib/activity";
 
 describe("activity", () => {
@@ -133,5 +134,15 @@ describe("activity", () => {
     it("multi-line with no recognized prefix is always received", () => {
       assert.equal(classifyLine("[A2A inbound] ⚙ bash\nsecond line"), "received");
     });
+  });
+});
+
+describe("isToolNoise (transcript noise filter)", () => {
+  it("hides tool churn, keeps arrival / assistant text / terminal lines", () => {
+    assert.isTrue(isToolNoise("[A2A inbound] ⚙ bash gh issue view 860"));
+    assert.isTrue(isToolNoise("[A2A inbound] ✓ read"));
+    assert.isFalse(isToolNoise("[A2A inbound] ✎ 设计收据已核：范围收敛"));
+    assert.isFalse(isToolNoise("[A2A inbound] dispatch from ceo (ctx-1):\n请核对"));
+    assert.isFalse(isToolNoise("[A2A inbound] A2A dispatch a2a-03a completed (42.0s)"));
   });
 });

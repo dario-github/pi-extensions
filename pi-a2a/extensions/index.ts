@@ -31,7 +31,7 @@ import {
 } from "./lib/client";
 import { A2AServer, type SessionRunner } from "./lib/server";
 import { formatPeers, listPeers } from "./lib/discovery";
-import { activityLine, activityStatusLine, activityToText, classifyLine, dispatchLabel, preview, type InboundActivity } from "./lib/activity";
+import { activityLine, activityStatusLine, activityToText, classifyLine, dispatchLabel, isToolNoise, preview, type InboundActivity } from "./lib/activity";
 import { appendInbox, digestUnread, readInbox, type InboxEntry } from "./lib/inbox";
 import { openPanel, type PanelAction } from "./lib/config-panel";
 
@@ -375,14 +375,18 @@ function broadcastActivity(
 ): void {
   const transcript = cfg?.ui?.transcript ?? true;
   const visibility = cfg?.inbound?.visibility ?? "signal";
-  if (transcript) {
+  const text = activityToText(a);
+  // Tool churn (⚙ bash …) is interface noise: drop it from the TUI unless asked
+  // for. Arrival, assistant text and terminal lines always show.
+  const noise = a.type === "progress" && !(cfg?.ui?.transcriptTools ?? false) && isToolNoise(text);
+  if (transcript && !noise) {
     try {
       if (visibility === "full") {
         // Debug mode: every activity line becomes a persisted message the
         // host model sees (the pre-#722 behavior — noisy, breaks cache).
-        pi.sendMessage({ customType: "a2a-inbound", content: activityToText(a), display: true }, { deliverAs: "nextTurn" });
+        pi.sendMessage({ customType: "a2a-inbound", content: text, display: true }, { deliverAs: "nextTurn" });
       } else {
-        pi.appendEntry("a2a-inbound", { text: activityToText(a) });
+        pi.appendEntry("a2a-inbound", { text });
       }
     } catch {
       /* session may be mid-replace; ignore */
