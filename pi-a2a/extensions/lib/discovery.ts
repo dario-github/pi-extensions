@@ -54,6 +54,10 @@ export function listPeers(opts: {
     ttlSec: opts.cfg.discovery.local.ttlSec,
   });
   for (const d of local) {
+    // Inbound child entries share the host's URL; they would otherwise
+    // overwrite the host's name here and make `a2a_call(<host>)` fail with
+    // "unknown agent" for as long as any inbound task is running.
+    if (d.kind === "inbound") continue;
     const key = normUrl(d.url);
     if (!key || key === selfKey) continue;
     byUrl.set(key, {

@@ -20,7 +20,7 @@ describe("index wiring — inbound inbox (#27)", () => {
     agentDir = makeTempDir("pi-a2a-idx-agent-");
     cwd = makeTempDir("pi-a2a-idx-cwd-");
     process.env.PI_CODING_AGENT_DIR = agentDir;
-    process.env.A2A_AGENT_NAME = "seatx-3"; // suffix must be stripped for the inbox seat key
+    process.env.A2A_AGENT_NAME = "seatx-3"; // pinned name is the inbox key, verbatim
   });
   afterEach(() => {
     if (savedDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -54,10 +54,10 @@ describe("index wiring — inbound inbox (#27)", () => {
     const ctx: any = { cwd };
     // Nothing unread yet → no injection.
     assert.isUndefined(await hook({ prompt: "hi" }, ctx));
-    // Two terminal entries land in the SEAT inbox (suffix stripped: seatx-3 → seatx).
+    // Two terminal entries land in the pinned identity's inbox.
     const later = new Date(Date.now() + 1000).toISOString();
-    appendInbox(agentDir, "seatx", { ts: later, taskId: "task-a", contextId: "c1", identity: "foreman", state: "TASK_STATE_COMPLETED", elapsedMs: 4200 });
-    appendInbox(agentDir, "seatx", { ts: later, taskId: "task-b", contextId: "c2", identity: "ceo", state: "TASK_STATE_FAILED", elapsedMs: 900, error: "boom" });
+    appendInbox(agentDir, "seatx-3", { ts: later, taskId: "task-a", contextId: "c1", identity: "foreman", state: "TASK_STATE_COMPLETED", elapsedMs: 4200 });
+    appendInbox(agentDir, "seatx-3", { ts: later, taskId: "task-b", contextId: "c2", identity: "ceo", state: "TASK_STATE_FAILED", elapsedMs: 900, error: "boom" });
     const r = await hook({ prompt: "what happened?" }, ctx);
     assert.exists(r?.message, "digest injected at the turn boundary");
     assert.equal(r.message.customType, "a2a-inbox");
@@ -73,10 +73,10 @@ describe("index wiring — inbound inbox (#27)", () => {
     const tool = tools.get("a2a_inbox");
     assert.exists(tool, "a2a_inbox registered");
     const ctx: any = { cwd };
-    appendInbox(agentDir, "seatx", { ts: new Date().toISOString(), taskId: "task-z", contextId: "cz", identity: "harness", state: "TASK_STATE_COMPLETED", elapsedMs: 61000, sessionFile: "/tmp/x/child.jsonl" });
+    appendInbox(agentDir, "seatx-3", { ts: new Date().toISOString(), taskId: "task-z", contextId: "cz", identity: "harness", state: "TASK_STATE_COMPLETED", elapsedMs: 61000, sessionFile: "/tmp/x/child.jsonl" });
     const list = await tool.execute("1", {}, undefined, undefined, ctx);
     const listText = list.content[0].text as string;
-    assert.include(listText, "seat seatx");
+    assert.include(listText, "seat seatx-3");
     assert.include(listText, "task-z · from harness · completed · 61s");
     const one = await tool.execute("2", { task_id: "task-z" }, undefined, undefined, ctx);
     const oneText = one.content[0].text as string;
@@ -84,5 +84,18 @@ describe("index wiring — inbound inbox (#27)", () => {
     assert.include(oneText, "/tmp/x/child.jsonl", "points at the child transcript when the reply is not in-process");
     const none = await tool.execute("3", { task_id: "task-nope" }, undefined, undefined, ctx);
     assert.include(none.content[0].text, "No inbound task");
+  });
+
+  it("an unpinned session never reads the principal's inbox (unpinned/ namespace)", async () => {
+    delete process.env.A2A_AGENT_NAME;
+    const { tools } = await loadExt();
+    const tool = tools.get("a2a_inbox");
+    const ctx: any = { cwd };
+    // Something lands in a pinned seat's box — an unpinned tab must not see it.
+    appendInbox(agentDir, "ceo", { ts: new Date().toISOString(), taskId: "task-p", contextId: "c", identity: "foreman", state: "TASK_STATE_COMPLETED", elapsedMs: 1000 });
+    const list = await tool.execute("1", {}, undefined, undefined, ctx);
+    const text = list.content[0].text as string;
+    assert.include(text, "unpinned/", "unpinned sessions get their own namespace");
+    assert.notInclude(text, "task-p", "principal's entries are invisible to the unpinned session");
   });
 });

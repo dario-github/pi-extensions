@@ -1,4 +1,6 @@
 import { assert } from "chai";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { DEFAULTS } from "./helpers";
 import { makeTempDir } from "./tmp";
@@ -112,6 +114,19 @@ describe("discovery merge", () => {
     const peers = listPeers({ cfg: { ...DEFAULTS() }, piDir: tmpPiDir() });
     const out = formatPeers(peers);
     assert.include(out, "No peers discovered");
+  });
+
+  it("inbound child entries never shadow the host that shares their URL", () => {
+    const dir = tmpPiDir();
+    const host = desc(process.pid, { url: "http://127.0.0.1:9920/", agentName: "mesh" });
+    register(host, dir);
+    // registerInbound() writes `<pid><seq>.json` with the host's url — sorts after `<pid>.json`.
+    writeFileSync(
+      join(dir, "a2a_registry", `${process.pid}001.json`),
+      JSON.stringify({ ...host, agentName: "mesh-inbound-1", kind: "inbound", status: "busy" }),
+    );
+    const names = listPeers({ cfg: { ...DEFAULTS() }, piDir: dir }).map((p) => p.name);
+    assert.deepEqual(names, ["mesh"]);
   });
 
   it("selfUrl excludes the caller's own entry", () => {

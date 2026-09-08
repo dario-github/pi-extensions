@@ -99,25 +99,28 @@ function workstationForCwd(cwd: string): string | null {
  *  `<base>` occupies seq 1, so a second session in the same workstation
  *  becomes `<base>-2`. Best-effort: races self-heal via the registry's
  *  stale-entry GC. */
-function allocRegistryName(base: string): string {
-  const names = new Set<string>();
+/** Session-stable suffix for auto names (#724 / DC 2026-09-08): the tail of
+ *  the pi session id (UUIDv7 — the HEAD is a timestamp and collides within a
+ *  day; the TAIL is random). One session, one name, never recycled: a
+ *  sequence number (`ceo-2`) is reclaimed on exit and handed to the next
+ *  session in the same directory, so dispatches aimed at the old holder land
+ *  on a stranger. Falls back to random when no session file exists yet. */
+function sessionSuffix(ctx?: { sessionManager?: { getSessionFile?: () => string | undefined } }): string {
   try {
-    for (const f of readdirSync(join(piDir(), "a2a_registry"))) {
-      if (!/^\d+\.json$/.test(f)) continue;
-      try {
-        const d = JSON.parse(readFileSync(join(piDir(), "a2a_registry", f), "utf-8"));
-        if (d?.agentName) names.add(String(d.agentName));
-      } catch {
-        /* skip unreadable entry */
-      }
-    }
+    const f = ctx?.sessionManager?.getSessionFile?.() ?? "";
+    const m = f.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+    if (m) return m[1]!.replace(/-/g, "").slice(-6).toLowerCase();
   } catch {
-    /* no registry dir yet */
+    /* fall through */
   }
-  let n = 1;
-  while (names.has(`${base}-${n}`) || (n === 1 && names.has(base))) n++;
-  return `${base}-${n}`;
+  return Math.random().toString(36).slice(2, 8);
 }
+
+/** Effective identity of THIS host process, fixed at session_start:
+ *  pinned (A2A_AGENT_NAME / settings) → that name, it IS the workstation
+ *  identity; unpinned → `<ws>-<sid tail>` or upstream's `<host>-<port>`,
+ *  which is a session handle, not an identity. */
+let hostIdentity: { name: string; pinned: boolean } | null = null;
 
 let inboundSeq = 0;
 
@@ -131,9 +134,8 @@ function registerInbound(cwd: string, sessionFile: string): (status: "done" | "a
   const pid = process.pid;
   const key = pid * 1000 + (++inboundSeq % 1000); // numeric, distinct from host <pid>.json
   const file = join(piDir(), "a2a_registry", `${key}.json`);
-  const ws = workstationForCwd(cwd);
-  const base = `${ws ?? hostname().replace(/\..*$/, "").toLowerCase()}-inbound`;
-  const name = allocRegistryName(base);
+  const base = `${hostIdentity?.name ?? workstationForCwd(cwd) ?? hostname().replace(/\..*$/, "").toLowerCase()}-inbound`;
+  const name = `${base}-${inboundSeq % 1000}`; // per-host counter; the host's own name already carries session identity
   const startedAt = new Date().toISOString();
   let desc: any = { url: "", port: 0, host: "127.0.0.1", model: null, tools: [], skills: [] };
   try {
@@ -394,14 +396,15 @@ function wakeEnabled(cfg: A2AConfig | undefined): boolean {
 
 let wakeCoalescer: WakeCoalescer | null = null;
 
-/** Seat key for the on-disk inbox: workstation name from workstations.tsv when
- *  the cwd sits under one, else the pinned agent name minus the uniqueness
- *  suffix pi-a2a appends (`-2`, `-yqrlu0`), else "default". */
+/** Inbox file key (#27, revised 2026-09-08 with ceo/DC): the PINNED identity
+ *  owns `<name>.jsonl` and is its only reader; an unpinned session (a hand-
+ *  opened tab, a mis-seated session borrowing a workstation dir) gets its
+ *  own `unpinned/<session-name>.jsonl` and never reads the principal's.
+ *  Neither the cwd's workstation nor a recyclable sequence name is a key. */
 function inboxSeat(cfg: A2AConfig | undefined): string {
-  const ws = workstationForCwd(process.cwd());
-  if (ws) return ws;
-  const name = cfg?.server.agentName || "";
-  return name.replace(/-(\d+|[a-z0-9]{6})$/, "") || "default";
+  if (hostIdentity) return hostIdentity.pinned ? hostIdentity.name : `unpinned/${hostIdentity.name}`;
+  const pinned = cfg?.server.agentName || process.env.A2A_AGENT_NAME || "";
+  return pinned || "unpinned/unknown";
 }
 
 /**
@@ -1337,11 +1340,15 @@ export default function a2aExtension(pi: ExtensionAPI): void {
     const cfg = cfgFor(ctx);
     if (!cfg.server.enabled) return;
     // AgentTeam patch: unpinned sessions in a workstation directory get an
-    // auditable name (<ws>-<seq>) instead of <host>-<port>. Pinned names
-    // (bin/ws A2A_AGENT_NAME or settings a2a.server.agentName) always win.
-    if (!cfg.server.agentName) {
+    // auditable, session-stable name (<ws>-<sid tail>) instead of <host>-<port>.
+    // Pinned names (bin/ws A2A_AGENT_NAME or settings a2a.server.agentName)
+    // always win and are the only names that count as workstation identity.
+    if (cfg.server.agentName) {
+      hostIdentity = { name: cfg.server.agentName, pinned: true };
+    } else {
       const ws = workstationForCwd(ctx.cwd ?? process.cwd());
-      if (ws) cfg.server.agentName = allocRegistryName(ws);
+      if (ws) cfg.server.agentName = `${ws}-${sessionSuffix(ctx as any)}`;
+      hostIdentity = { name: cfg.server.agentName || "", pinned: false };
     }
     try {
       server = new A2AServer({

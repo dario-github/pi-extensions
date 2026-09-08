@@ -32,6 +32,8 @@ export interface SessionDescriptor {
   skills: AgentSkill[]; // configured inbound skills
   startedAt: string; // ISO
   mtime: number; // epoch ms — heartbeat freshness (Date.now())
+  /** "inbound" = detached child-task entry (shares the host's URL); Dashboard-only, never a peer. */
+  kind?: string;
 }
 
 function dir(piDir: string): string {
